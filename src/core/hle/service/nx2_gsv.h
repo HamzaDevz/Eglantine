@@ -70,11 +70,15 @@
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
+#include "core/hle/service/nx2_movie_pacing.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/service.h"
 
 namespace Service {
+
+/// LOCAL TEST (Zelda): steady-clock time of the last decoded video frame (PaceToVblank).
+inline std::atomic<s64> g_nx2_video_last_frame_ns{0};
 
 // Creates a session served by `iface` and returns its client end. Unlike PushIpcInterface this
 // works from a domain too, for callers that want a raw session handle.
@@ -1448,6 +1452,7 @@ private:
 // shared with the vi2 session so presents can find an image's memory. Command meanings follow
 // the shared changes.patch (IGraphicsSupervisor), re-checked against title 4's SDK.
 struct Nx2NativeObjects {
+    MkwMovieActivity mkw_movie_activity;
     struct Memory {
         u64 size{};
         u64 address{}; // CPU (== GPU) address once bound by 114/423
@@ -1744,10 +1749,14 @@ private:
         // Donkey Kong Bananza's channels wait on each other every frame, so it always ran a frame
         // ahead, where it rewrote memory the GPU thread hadn't read yet (misread commands, then
         // a freeze or crash; rubberbanding while moving). Title 1 runs ahead without either.
+        // Ocarina of Time a frame ahead rewrote data the GPU thread still read for this frame, and
+        // the frame rendered with the next one's (one-frame white or overexposed flashes).
         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
+        constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
         int frames_ahead = frames_ahead_setting;
-        if (frames_ahead == -1 &&
-            system.GetApplicationProcessProgramID() == DonkeyKongBananzaProgramId) {
+        const u64 app_program_id = system.GetApplicationProcessProgramID();
+        if (frames_ahead == -1 && (app_program_id == DonkeyKongBananzaProgramId ||
+                                   app_program_id == OcarinaOfTimeProgramId)) {
             frames_ahead = 0;
         }
         const auto entered = std::chrono::steady_clock::now();
@@ -1847,6 +1856,11 @@ private:
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
             return;
         }
+        const auto movie_now = std::chrono::steady_clock::now();
+        if (m_objects->mkw_movie_activity.Active(movie_now)) {
+            m_next_vblank = movie_now;
+            return;
+        }
         static const u32 forced_interval = [] {
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
@@ -1859,7 +1873,16 @@ private:
         if (mkw_dynamic) {
             swap_interval = 1;
         }
-        if (forced_interval != 0) {
+        // LOCAL TEST (Zelda): not while a video plays. Ocarina's cutscene videos are 60 fps AV1;
+        // forced to two vblanks a frame they played at half rate.
+        const s64 video_ns = g_nx2_video_last_frame_ns.load(std::memory_order_relaxed);
+        const bool video_playing =
+            video_ns != 0 &&
+            std::chrono::steady_clock::now().time_since_epoch().count() - video_ns <
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::milliseconds{500})
+                    .count();
+        if (forced_interval != 0 && !video_playing) {
             swap_interval = forced_interval;
         }
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
@@ -2507,6 +2530,9 @@ public:
             m_cv.notify_all();
             m_worker.join();
         }
+        if (m_movie_program_id == 0x0400C3F00006E000ULL && m_width >= 1920) {
+            m_objects->mkw_movie_activity.Reset();
+        }
         // The ready timer runs on the HostTiming thread: clear its event under its lock first.
         {
             std::scoped_lock lk{m_ready->mutex};
@@ -2550,6 +2576,11 @@ private:
     static constexpr size_t MaxQueuedInputs = 8;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
+    // Movie pacing (see DropOvertakenFrames): a longer gap between acquires is a pause, a longer
+    // lag a jump in the stream; both restart the clock instead of dropping frames.
+    static constexpr s64 PauseGap = 1'000'000;   // us
+    static constexpr s64 MaxCatchUp = 3'000'000; // us
+    static constexpr u32 MaxDroppedInARow = 30;
 
     void Log(HLERequestContext& ctx, std::string_view what) {
         const auto* w = ctx.CommandBuffer();
@@ -2622,6 +2653,9 @@ private:
             m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
+            m_clock_offset.reset();
+            const auto* process = ctx.GetThread().GetOwnerProcess();
+            m_movie_program_id = process ? process->GetProgramId() : 0;
         }
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
@@ -2755,6 +2789,7 @@ private:
             m_inputs.clear();
             m_flush = true;
             m_stream_ended = false;
+            m_clock_offset.reset();
             m_ready->room.store(true, std::memory_order_relaxed);
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
             // fence as a frame to acquire.
@@ -2771,8 +2806,80 @@ private:
         {
             std::scoped_lock lk{m_mutex};
             CompleteHandedFences();
+            m_clock_offset.reset();
         }
         TipcReplyWords(ctx, {});
+    }
+
+    static bool PacingEnabled() {
+        // EDEN_NX2_VDEC_PACE=0: hand out every decoded frame, however late.
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_VDEC_PACE");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    static s64 HostTimeUs() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    // Starts or corrects the movie clock from a frame the client just acquired (m_mutex held).
+    // The clock never runs behind a frame the client already shows.
+    void AnchorClock(u64 pts) {
+        const s64 now = HostTimeUs();
+        const s64 offset = now - static_cast<s64>(pts);
+        if (!m_clock_offset || now - m_last_acquire > PauseGap || pts < m_last_acquired_pts ||
+            offset < *m_clock_offset || offset - *m_clock_offset > MaxCatchUp) {
+            m_clock_offset = offset;
+        }
+        m_last_acquire = now;
+        m_last_acquired_pts = pts;
+    }
+
+    // The pts the movie's audio has reached, if the client shows frames yet (m_mutex held).
+    std::optional<u64> DuePts() {
+        if (!m_clock_offset) {
+            return std::nullopt;
+        }
+        const s64 now = HostTimeUs();
+        const s64 due = now - *m_clock_offset;
+        // Nothing acquired for a while: paused; the next acquire restarts the clock.
+        if (due < 0 || now - m_last_acquire > PauseGap) {
+            return std::nullopt;
+        }
+        return static_cast<u64>(due);
+    }
+
+    // Games such as Ocarina of Time show one decoded frame per frame they draw and never skip
+    // one, while the movie's audio plays in real time: below the movie's frame rate the picture
+    // falls further behind the sound. Drop decoded frames a later frame has already overtaken
+    // (m_mutex held). Returns true when the only frame left is late and more input is queued:
+    // decode on before filling an image.
+    bool DropOvertakenFrames() {
+        if (!PacingEnabled() || m_decoded.empty()) {
+            return false;
+        }
+        const auto due = DuePts();
+        if (!due) {
+            m_dropped_in_a_row = 0;
+            return false;
+        }
+        while (m_decoded.size() >= 2 && m_dropped_in_a_row < MaxDroppedInARow) {
+            const Decoded& front = m_decoded[0];
+            const Decoded& next = m_decoded[1];
+            if (front.end || !front.picture || next.pts <= front.pts || next.pts > *due) {
+                break;
+            }
+            m_decoded.pop_front();
+            ++m_frames_dropped;
+            ++m_dropped_in_a_row;
+        }
+        const Decoded& front = m_decoded.front();
+        return m_decoded.size() == 1 && !m_inputs.empty() && !front.end &&
+               m_dropped_in_a_row < MaxDroppedInARow && front.pts + m_frame_interval < *due;
     }
 
     // Advances the decoder's syncpoint to the last value handed out (m_mutex held).
@@ -2797,6 +2904,7 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
+                AnchorClock(output->pts);
             }
         }
         if (!output) {
@@ -2831,6 +2939,11 @@ private:
             if (m_flush) {
                 m_flush = false;
                 m_decoded.clear();
+                m_last_decoded_pts = 0;
+                m_dropped_in_a_row = 0;
+                if (MkwMovieActivity::IsLargeMovie(m_movie_program_id, m_width)) {
+                    m_objects->mkw_movie_activity.Reset();
+                }
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -2838,7 +2951,8 @@ private:
                 }
                 continue;
             }
-            if (!m_decoded.empty() && !m_free.empty()) {
+            if (!m_decoded.empty() && !m_free.empty() && !DropOvertakenFrames()) {
+                m_dropped_in_a_row = 0;
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
                 const u32 image = m_free.front();
@@ -2855,6 +2969,10 @@ private:
                 const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
+                if (!m_flush && frame.picture && frame.picture->frame &&
+                    MkwMovieActivity::IsLargeMovie(m_movie_program_id, frame.picture->width)) {
+                    m_objects->mkw_movie_activity.RecordFrame(std::chrono::steady_clock::now());
+                }
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
                 if (frame.end) {
                     m_stream_ended = true;
@@ -2863,9 +2981,10 @@ private:
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 ++m_frames_out;
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
-                    LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
+                    LOG_INFO(Service,
+                             "{} frame {} ({}x{}, pts {} us{}) in image {}, {} late dropped",
                              GetServiceName(), m_frames_out, width, height, frame.pts,
-                             frame.end ? ", end of stream" : "", image);
+                             frame.end ? ", end of stream" : "", image, m_frames_dropped);
                 }
                 continue;
             }
@@ -2890,12 +3009,21 @@ private:
             if (input.end) {
                 decoder->Drain(pictures);
             }
+            if (!pictures.empty()) {
+                g_nx2_video_last_frame_ns.store(
+                    std::chrono::steady_clock::now().time_since_epoch().count(),
+                    std::memory_order_relaxed);
+            }
             lk.lock();
             if (m_flush) {
                 continue;
             }
             for (auto& picture : pictures) {
                 const u64 pts = picture.pts;
+                if (pts > m_last_decoded_pts && pts - m_last_decoded_pts <= 100'000) {
+                    m_frame_interval = pts - m_last_decoded_pts;
+                }
+                m_last_decoded_pts = pts;
                 m_decoded.push_back({std::move(picture), pts, false});
             }
             if (input.end) {
@@ -3027,8 +3155,16 @@ private:
     std::string m_codec;
     u32 m_width{};
     u32 m_height{};
+    u64 m_movie_program_id{};
     u32 m_handed{}; ///< Output images handed out (registered or released) so far
     u64 m_frames_out{};
+    u64 m_frames_dropped{};
+    std::optional<s64> m_clock_offset; ///< Host time minus pts (us) of the frames the client shows
+    s64 m_last_acquire{};              ///< Host time (us) of the client's last acquire
+    u64 m_last_acquired_pts{};
+    u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
+    u64 m_last_decoded_pts{};
+    u32 m_dropped_in_a_row{};
     std::deque<Input> m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
@@ -3409,7 +3545,12 @@ private:
     // size, u64 alignment; the client raises the alignment to at least 4 KiB and rounds the size.
     void CalculateRequirements(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
-        const auto layout = Nx2CalculateImageLayout(w + 2);
+        auto layout = Nx2CalculateImageLayout(w + 2);
+        // Star Fox's NVN window textures use 4 KiB pool offsets. Reporting the block-linear
+        // layout's 8 KiB alignment makes NativeWindow::Acquire reject those textures.
+        if (system.GetApplicationProcessProgramID() == 0x0400E88025B1A000ULL) {
+            layout.alignment = 0x1000;
+        }
         LOG_DEBUG(Service, "nx2:gsv 1510 kind={} {}x{} block={} pitch={:#x} format={} -> size={:#x} align={:#x}",
                   w[3], layout.width, layout.height, layout.block_height_log2, layout.pitch, w[8],
                   layout.size, layout.alignment);
