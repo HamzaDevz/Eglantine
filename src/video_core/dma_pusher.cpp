@@ -575,6 +575,9 @@ void DmaPusher::CallMethod(u32 argument) {
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+            } else if (split.Active() &&
+                       subchannel_type[dma_state.subchannel] == Engines::EngineTypes::KeplerMemory) {
+                split.NoteMemoryWrite();
             }
         };
         if (split.Active()) {
@@ -633,6 +636,10 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+            } else if (split.Active() &&
+                       subchannel_type[dma_state.subchannel] == Engines::EngineTypes::KeplerMemory) {
+                // Inline uploads: what MME DMA reads may read next (FrontDmaRead).
+                split.NoteMemoryWrite();
             }
         };
         if (split.Active()) {

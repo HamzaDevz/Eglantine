@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -150,6 +151,27 @@ public:
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
 
+    /// Other work that writes guest memory was just sent (inline uploads, semaphore releases).
+    void NoteMemoryWrite() {
+        last_memory_write_position = write_position;
+    }
+    /// Waits until the back executed every write noted so far (NoteWriter, NoteMemoryWrite).
+    void WaitForMemoryWrites() {
+        WaitForPosition(std::min(std::max(last_writer_position, last_memory_write_position),
+                                 write_position));
+    }
+    /// The ring position past everything sent so far (front only).
+    [[nodiscard]] u64 Position() const {
+        return write_position;
+    }
+    /// The ring position the back has executed up to, as last published by it (any thread).
+    [[nodiscard]] u64 Consumed() const {
+        return consumed.load(std::memory_order_acquire);
+    }
+    /// Waits until the back executed everything sent before `target`, without the idle hook a
+    /// Drain waits for. Returns whether it had not yet.
+    bool WaitForPosition(u64 target);
+
 private:
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -207,6 +229,7 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    u64 last_memory_write_position{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

@@ -251,7 +251,10 @@ void GpuSplit::Drain() {
 }
 
 bool GpuSplit::WaitForWriters() {
-    const u64 target = std::min(last_writer_position, write_position);
+    return WaitForPosition(std::min(last_writer_position, write_position));
+}
+
+bool GpuSplit::WaitForPosition(u64 target) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
         return false;
