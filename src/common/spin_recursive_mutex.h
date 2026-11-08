@@ -86,10 +86,16 @@ private:
         // 2: held with (possible) sleepers; taken this way it stays marked, so its unlock wakes
         // the next sleeper.
         while (state.exchange(2, std::memory_order_acquire) != 0) {
+            last_slept_on.store(this, std::memory_order_relaxed);
             state.wait(2, std::memory_order_relaxed);
         }
     }
 
+public:
+    /// The lock a thread last went to sleep on: hang dumps read its state and owner from memory.
+    static inline std::atomic<const SpinRecursiveMutex*> last_slept_on{};
+
+private:
     std::atomic<std::uint32_t> state{0}; ///< 0 free, 1 held, 2 held with sleepers
     std::atomic<std::thread::id> owner{};
     std::uint32_t depth{}; ///< Recursion depth, touched only by the owner
