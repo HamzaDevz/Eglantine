@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -142,6 +145,12 @@ struct Values {
 
     Setting<bool> check_for_updates{linkage, true, "check_for_updates", Category::UiGeneral};
 
+    // Unset until a tagged release or daily build first runs, then only the user changes it
+    Setting<Settings::UpdateChannel> update_channel{linkage, Settings::UpdateChannel::Unset,
+                                                    "update_channel", Category::UiGeneral};
+    // Tag of the release the user chose not to be reminded of
+    Setting<std::string> skipped_update{linkage, {}, "skipped_update", Category::Ui};
+
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,
 #ifndef _MSC_VER
@@ -235,6 +244,7 @@ struct Values {
 
     // misc
     Setting<bool> show_fw_warning{linkage, true, "show_fw_warning", Category::Miscellaneous};
+    Setting<bool> check_legacy_paths{linkage, true, "check_legacy_paths", Category::UiGeneral};
 
     bool configuration_applied;
     bool reset_to_defaults;

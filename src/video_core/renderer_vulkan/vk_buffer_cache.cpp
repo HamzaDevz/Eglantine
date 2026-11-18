@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -5,12 +8,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cstring>
 #include <cstdlib>
 #include <span>
 #include <vector>
 
+#include "common/scope_exit.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -95,7 +100,8 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
 } // Anonymous namespace
 
 Buffer::Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_params)
-    : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, tracker{4096} {
+    : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, tracker{4096},
+      pass_tracker{4096} {
     if (runtime.device.HasNullDescriptor()) {
         return;
     }
@@ -113,7 +119,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
       scheduler{&runtime.scheduler},
       buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
                           runtime.SparseAlignmentFor(sparse_compatible_))},
-      tracker{SizeBytes()} {
+      tracker{SizeBytes()}, pass_tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
     if (runtime.device.HasDebuggingToolAttached()) {
         buffer.SetObjectNameEXT(fmt::format("Buffer {:#x}", CpuAddr()).c_str());
@@ -137,6 +143,18 @@ void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
         last_usage_tick = current_tick;
     }
     tracker.Track(offset, size);
+    if (const u64 epoch = scheduler->PassEpoch(); epoch != pass_epoch) {
+        pass_tracker.Reset();
+        pass_epoch = epoch;
+    }
+    pass_tracker.Track(offset, size);
+}
+
+bool Buffer::IsRegionUsedInPass(u64 offset, u64 size) const noexcept {
+    if (scheduler->PassEpoch() != pass_epoch) {
+        return false;
+    }
+    return pass_tracker.IsUsed(offset, size);
 }
 
 VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {
@@ -488,14 +506,51 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     if (master.IsFree(tick)) {
         return;
     }
+    // EDEN_NX2_LIST_COPY_STATS=1 (diagnostic): how a front wait for a tick splits into waiting for
+    // its submission and for the GPU after it, and how much GPU work was in flight.
+    static const bool stats = [] {
+        const char* value = std::getenv("EDEN_NX2_LIST_COPY_STATS");
+        return value != nullptr && value[0] == '1';
+    }();
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point start = stats ? Clock::now() : Clock::time_point{};
+    const bool submitted_at_start = stats && scheduler.IsSubmitted(tick);
+    const u64 in_flight = stats ? master.CurrentTick() - (std::min)(master.CurrentTick(),
+                                                                     master.KnownGpuTick() + 1)
+                                : 0;
+    const u64 ahead = stats && tick > master.KnownGpuTick() ? tick - master.KnownGpuTick() : 0;
+    Clock::time_point submitted = start;
+    SCOPE_EXIT {
+        if (stats) {
+            const Clock::time_point done = Clock::now();
+            static u64 waits{}, already{}, submit_ns{}, gpu_ns{}, flight{}, ticks_ahead{};
+            ++waits;
+            already += submitted_at_start;
+            submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(submitted - start).count();
+            gpu_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(done - submitted).count();
+            flight += in_flight;
+            ticks_ahead += ahead;
+            if ((waits % 2000) == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "nx2 list copy waits: {} waits, {} already submitted; mean {:.3f} ms "
+                         "until submitted, {:.3f} ms GPU after; {:.2f} submissions in flight, "
+                         "{:.2f} ticks to the copy's",
+                         waits, already, submit_ns / 1e6 / waits, gpu_ns / 1e6 / waits,
+                         static_cast<double>(flight) / waits,
+                         static_cast<double>(ticks_ahead) / waits);
+            }
+        }
+    };
     // The copy's submission may be deferred (Scheduler::DeferFlush): the split's front asks the
     // back for it rather than waiting for the back's next submission. If the back has stopped,
     // nothing else uses the scheduler and Wait submits it.
     if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread() && !scheduler.WaitSubmitted(tick)) {
+        submitted = stats ? Clock::now() : submitted;
         scheduler.Wait(tick);
         return;
     }
+    submitted = stats ? Clock::now() : submitted;
     master.Wait(tick);
 }
 
@@ -503,7 +558,18 @@ void BufferCacheRuntime::Finish() {
     scheduler.Finish();
 }
 
-bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
+namespace {
+// EDEN_NX2_UPLOAD_HOIST=0: in-order buffer uploads end the render pass, as before.
+bool UploadHoistEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_UPLOAD_HOIST");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // namespace
+
+bool BufferCacheRuntime::CanReorderUpload(Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
     if (Settings::values.disable_buffer_reorder) {
         return false;
@@ -512,6 +578,20 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
         std::ranges::all_of(copies, [&](const VideoCommon::BufferCopy& copy) {
             return !buffer.IsRegionUsed(copy.dst_offset, copy.size);
         });
+    // Used earlier in the submission: the upload must come after that use. If no draw of the
+    // held render pass used it yet, it can run just before that pass instead of ending it
+    // (CopyBuffer). Its destination then counts as used in the pass, so a second upload of the
+    // same bytes, or one after a draw read them, keeps its place.
+    hoist_next_upload = false;
+    if (!can_use_upload_cmdbuf && UploadHoistEnabled() && scheduler.CanHoistUpload() &&
+        std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
+            return buffer.IsRegionUsedInPass(copy.dst_offset, copy.size);
+        })) {
+        hoist_next_upload = true;
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            buffer.MarkUsage(copy.dst_offset, copy.size);
+        }
+    }
     return can_use_upload_cmdbuf;
 }
 
@@ -544,8 +624,26 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         });
         return;
     }
+    if (std::exchange(hoist_next_upload, false) && src_buffer == staging_pool.StreamBuf() &&
+        scheduler.CanHoistUpload()) {
+        // Before the held render pass (CanReorderUpload); the scheduler puts the barriers
+        // around all of the pass's hoisted uploads.
+        scheduler.RecordBeforeRenderPass(
+            Scheduler::PrePassStage::Upload,
+            [src_buffer, dst_buffer, vk_copies](vk::CommandBuffer cmdbuf) {
+                cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+            });
+        return;
+    }
 
     scheduler.RequestOutsideRenderPassOperationContext();
+    if (barrier && src_buffer == staging_pool.StreamBuf() && !vk_copies.empty()) {
+        // Only in-order stream uploads share barriers. Dedicated staging buffers retain their
+        // normal recording path and tick-based reuse.
+        scheduler.RecordUpload(src_buffer, dst_buffer,
+                               std::span<const VkBufferCopy>{vk_copies.data(), vk_copies.size()});
+        return;
+    }
     scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
         if (barrier) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
@@ -553,8 +651,10 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         }
         cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
         if (barrier) {
+            // Later transfers too: a reordered upload of the same bytes in a later submission
+            // has no barrier of its own before it.
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, WRITE_BARRIER);
+                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
         }
     });
 }
@@ -582,8 +682,9 @@ void BufferCacheRuntime::PostCopyBarrier() {
     };
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
-                               0, WRITE_BARRIER);
+        // Copies bracketed explicitly need the same ordering as CopyBuffer(barrier = true).
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
     });
 }
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -33,6 +36,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sampler.h"
 
 namespace VideoCommon {
 
@@ -118,6 +122,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         const char* value = std::getenv("EDEN_NX2_SPLIT");
         return value != nullptr ? value[0] : '2';
     }();
+    VideoCommon::Nx2Sampler::Sampler::MaybeStart();
     const bool wanted = mode == '1' || mode == '2';
     if (!wanted || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         return;
@@ -173,7 +178,8 @@ void GpuSplit::Stop() {
     last_sync_position = 0;
     last_function_position = 0;
     writes.Reset();
-    async_writes.clear();
+    std::ranges::fill(async_writes, u64{0});
+    any_async_write = false;
     cb_words.clear();
     cb_words_lost = 0;
     note_memory = nullptr;

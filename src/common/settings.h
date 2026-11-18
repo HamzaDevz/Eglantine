@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -563,6 +566,15 @@ struct Values {
                                                            VramUsageMode::Conservative,
                                                            "vram_usage_mode",
                                                            Category::RendererAdvanced};
+    // Video memory kept free of the driver's budget, in MiB. -1: automatic (an eighth of the
+    // budget, at most 1 GiB). Used for the reported VRAM and the texture cache's margin.
+    SwitchableSetting<int, true> vram_reserve_mib{linkage,
+                                                  -1,
+                                                  -1,
+                                                  4096,
+                                                  "vram_reserve_mib",
+                                                  Category::RendererAdvanced,
+                                                  Specialization::Countable};
 
     SwitchableSetting<NvdecEmulation> nvdec_emulation{linkage, NvdecEmulation::Cpu,
                                                       "nvdec_emulation", Category::RendererAdvanced};
@@ -616,6 +628,37 @@ struct Values {
         linkage, true, "use_vulkan_driver_pipeline_cache", Category::RendererAdvanced,
         Specialization::Default};
 
+    // Off: task/mesh draws take the compute fallback even when the device has VK_EXT_mesh_shader.
+    SwitchableSetting<bool> use_mesh_shaders{linkage, true, "use_mesh_shaders",
+                                             Category::RendererAdvanced};
+
+    // Linux: the GPU driver's shader cache in a folder of our own (ConfigureDriverShaderCache),
+    // with its size limit in GiB. Applied at startup, before anything loads a driver.
+    Setting<bool> private_driver_shader_cache{linkage, true, "private_driver_shader_cache",
+                                              Category::RendererAdvanced, Specialization::Paired};
+    Setting<u32, true> driver_shader_cache_size{linkage,
+                                                10,
+                                                1,
+                                                1024,
+                                                "driver_shader_cache_size",
+                                                Category::RendererAdvanced,
+                                                Specialization::Countable,
+                                                true,
+                                                false,
+                                                &private_driver_shader_cache};
+
+    // Guest memory of uploaded textures and buffers, which the host GPU holds a copy of
+    // (HostMemory::HintCold): Always pages it out at each pass, which lowers RAM use but stalls the
+    // GPU threads (Mario Kart World: 60-700 ms every 600 frames); WhenRamIsLow only marks it to be
+    // reclaimed first, and pages it out while the system is short of memory.
+    Setting<ColdHintMode> cold_hint_mode{linkage,
+                                         ColdHintMode::Off,
+                                         "cold_hint_mode",
+                                         Category::RendererMemory,
+                                         Specialization::Default,
+                                         true,
+                                         true};
+
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
                                                      Category::RendererAdvanced};
 
@@ -626,6 +669,9 @@ struct Values {
     SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
     SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
                                             Category::RendererAdvanced};
+    SwitchableSetting<bool> hyrule_dynamic_fps{linkage, false, "hyrule_dynamic_fps",
+                                               Category::RendererAdvanced};
+    SwitchableSetting<bool> hyrule_30fps{linkage, false, "hyrule_30fps", Category::RendererAdvanced};
 
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__
@@ -774,8 +820,8 @@ struct Values {
                                       false,   true, &custom_rtc_enabled};
     SwitchableSetting<s64, true> custom_rtc_offset{linkage,
                                                    0,
-                                                   (std::numeric_limits<s64>::min)(),
-                                                   (std::numeric_limits<s64>::max)(),
+                                                   (std::numeric_limits<int>::min)(),
+                                                   (std::numeric_limits<int>::max)(),
                                                    "custom_rtc_offset",
                                                    Category::System,
                                                    Specialization::Countable,
@@ -896,6 +942,11 @@ struct Values {
     bool record_frame_times;
     Setting<bool> use_gdbstub{linkage, false, "use_gdbstub", Category::Debugging};
     Setting<u16> gdbstub_port{linkage, 6543, "gdbstub_port", Category::Debugging};
+    // Built-in MCP server (see tools/mcp/README.md). Loopback only, off by default.
+    Setting<bool> enable_mcp_server{linkage, false, "enable_mcp_server", Category::Debugging};
+    Setting<u16> mcp_port{linkage, 6544, "mcp_port", Category::Debugging};
+    Setting<bool> mcp_allow_writes{linkage, false, "mcp_allow_writes", Category::Debugging};
+    Setting<std::string> mcp_token{linkage, std::string{}, "mcp_token", Category::Debugging};
     SwitchableSetting<std::string> program_args{linkage,
                                                 std::string(),
                                                 "program_args",
@@ -964,7 +1015,7 @@ struct Values {
     // WebService
     Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",
                                      Category::WebService};
-    Setting<std::string> eden_username{linkage, "Eden", "eden_username",
+    Setting<std::string> eden_username{linkage, "Eglantine", "eden_username",
                                        Category::WebService};
     Setting<std::string> eden_token{linkage, "",
                                     "eden_token", Category::WebService};
@@ -1014,6 +1065,10 @@ bool CurrentProgramIsSwitch2();
 // The ASTC recompression in effect: astc_recompression, unless the renderer picked another one
 // for the running program (the configuration is left as is). The core clears it on load.
 AstcRecompression GetAstcRecompression();
+
+// The video memory to keep free of a driver budget: vram_reserve_mib, or with -1 an eighth of
+// the budget, at most 1 GiB. Never more than the budget.
+u64 GetVramReserve(u64 budget);
 void SetAstcRecompressionOverride(std::optional<AstcRecompression> recompression);
 
 bool IsOpenGL();

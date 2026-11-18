@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -114,12 +117,13 @@ std::string GetTimeZoneString(TimeZone time_zone) {
     return location_name;
 }
 
+/// Logs every setting's value, modified ones first, hiding the token secrets.
 void LogSettings() {
     std::deque<std::string> settings_list;
     for (auto& [category, settings] : values.linkage.by_category) {
         for (const auto& setting : settings) {
-            // Hide the token secret, for security reasons.
-            if (setting->Id() != values.eden_token.Id()) {
+            // Hide the token secrets, for security reasons.
+            if (setting->Id() != values.eden_token.Id() && setting->Id() != values.mcp_token.Id()) {
                 auto const is_default = setting->ToString() == setting->DefaultToString();
                 auto const name = fmt::format(
                     "{:c}{:c} {}.{}",
@@ -241,6 +245,15 @@ AstcRecompression GetAstcRecompression() {
     return astc_recompression_override.value_or(values.astc_recompression.GetValue());
 }
 
+u64 GetVramReserve(u64 budget) {
+    const int mib = values.vram_reserve_mib.GetValue();
+    if (mib < 0) {
+        return budget / 8 < (u64{1} << 30) ? budget / 8 : (u64{1} << 30);
+    }
+    const u64 reserve = static_cast<u64>(mib) << 20;
+    return reserve < budget ? reserve : budget;
+}
+
 void SetAstcRecompressionOverride(std::optional<AstcRecompression> recompression) {
     astc_recompression_override = recompression;
 }
@@ -275,6 +288,7 @@ const char* TranslateCategory(Category category) {
     case Category::RendererHacks:
     case Category::RendererDebug:
     case Category::RendererExtensions:
+    case Category::RendererMemory:
         return "Renderer";
     case Category::System:
     case Category::SystemAudio:

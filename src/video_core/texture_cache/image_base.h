@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -60,6 +63,10 @@ enum class ImageFlagBits : u32 {
     /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
     /// the parts written are uploaded.
     SparseTiles = 1 << 23,
+    /// A SparseTiles image whose guest tiles were unmapped: before its next use its blocks go
+    /// back to the zeroed one and the tiles mapped then are loaded again (TextureCache::
+    /// RefreshUnmappedSparseTiles), instead of deleting and re-creating the image.
+    SparseTilesUnmapped = 1 << 24,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -104,7 +111,7 @@ struct ImageBase {
 
     ImageInfo info;
 
-    u32 guest_size_bytes = 0;
+    u64 guest_size_bytes = 0;
     u32 unswizzled_size_bytes = 0;
     u32 converted_size_bytes = 0;
     u32 scale_rating = 0;
@@ -127,6 +134,8 @@ struct ImageBase {
     VAddr cpu_addr_end = 0;
 
     u64 modification_tick = 0;
+    /// Tick of the latest CPU write: an upload of that data is as new as the write, not newer.
+    u64 cpu_modification_tick = 0;
     u64 first_written_frame = 0; ///< First frame_tick+1 a non-clear GPU write modified this image.
     u64 last_written_frame = 0;  ///< Last frame_tick+1 a non-clear GPU write modified this image.
     u64 cleared_frame = 0;       ///< Last frame_tick+1 a full clear invalidated this image.

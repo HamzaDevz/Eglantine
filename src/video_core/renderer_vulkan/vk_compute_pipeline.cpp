@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -5,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -15,6 +19,7 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -137,7 +142,10 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineIndex = 0,
         };
         try {
+            const auto build_begin = std::chrono::steady_clock::now();
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            DriverBuildReport::Record(DriverBuildReport::Kind::Compute,
+                                      std::chrono::steady_clock::now() - build_begin);
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
@@ -197,6 +205,13 @@ void ComputePipeline::RunBuild() {
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                 BufferCache& buffer_cache, TextureCache& texture_cache) {
+    static const bool writer_deps = [] {
+        const char* value = std::getenv("EDEN_NX2_WRITER_DEPS");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (RecordingSampledTextures() || writer_deps) {
+        sampled_images.clear();
+    }
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
@@ -289,14 +304,17 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         if (!views.empty()) {
             texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
         }
-        if (RecordingSampledTextures()) {
-            sampled_images.clear();
+        if (RecordingSampledTextures() || writer_deps) {
             const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                                  Shader::NumDescriptors(info.image_buffer_descriptors);
             const size_t count = Shader::NumDescriptors(info.texture_descriptors);
             for (size_t view_index = first; view_index < first + count; ++view_index) {
+                const auto state = writer_deps
+                                       ? texture_cache.Nx2ViewWrittenState(views[view_index].id)
+                                       : std::pair{false, false};
                 sampled_images.push_back(
-                    {views[view_index].index, views[view_index].id, samplers[view_index - first]});
+                    {views[view_index].index, views[view_index].id, samplers[view_index - first],
+                     state.first, state.second});
             }
         }
         if (RecordingWrittenImages()) {
@@ -353,9 +371,6 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
                              views_it);
     } else {
-        if (RecordingSampledTextures()) {
-            sampled_images.clear();
-        }
         if (RecordingWrittenImages()) {
             written_images.clear();
         }

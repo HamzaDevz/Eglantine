@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -181,9 +184,24 @@ struct GPU::Impl {
     }
 
     [[nodiscard]] u64 GetTicks() const {
-        return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
-                                Settings::values.gpu_clock.GetValue(),
+        const bool ampere = g_nx2_ampere.load(std::memory_order_relaxed) && !LegacyTimestamps();
+        return ReadGpuTimestamp(system.CoreTiming(), ampere, Settings::values.gpu_clock.GetValue(),
                                 present_ns.load(std::memory_order_relaxed));
+    }
+
+    /// Whether the running title keeps GPU tick timestamps (UsesLegacyAmpereTimestamps). Known
+    /// once the application process exists; until then (program id 0) nanoseconds are used.
+    [[nodiscard]] bool LegacyTimestamps() const {
+        s8 known = legacy_timestamps.load(std::memory_order_relaxed);
+        if (known < 0) {
+            const u64 program_id = system.GetApplicationProcessProgramID();
+            if (program_id == 0) {
+                return false;
+            }
+            known = UsesLegacyAmpereTimestamps(program_id) ? 1 : 0;
+            legacy_timestamps.store(known, std::memory_order_relaxed);
+        }
+        return known != 0;
     }
 
     void RendererFrameEndNotify() {
@@ -225,8 +243,10 @@ struct GPU::Impl {
         gpu_thread.SubmitList(channel, std::move(entries), is_async);
     }
 
+    // Queued without waiting, also with synchronous GPU: callers hold nx2:gpu locks that the GPU
+    // back thread takes while running the map (flushes write back into sparse regions).
     void RunInOrder(std::function<void()>&& func) {
-        gpu_thread.Run(std::move(func), is_async);
+        gpu_thread.Run(std::move(func), true);
     }
 
     void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
@@ -244,7 +264,7 @@ struct GPU::Impl {
                 std::erase_if(pending_maps, [id](const PendingMap& map) { return map.id == id; });
                 pending_map_count.store(pending_maps.size(), std::memory_order_release);
             },
-            is_async, true);
+            true, true); // not waited for, as in RunInOrder
     }
 
     bool IsMapPending(GPUVAddr gpu_addr, u64 size) const {
@@ -402,6 +422,7 @@ struct GPU::Impl {
     std::atomic<bool> has_sync_requests{};
     std::atomic<u64> current_sync_fence{};
     std::atomic<u64> present_ns{};
+    mutable std::atomic<s8> legacy_timestamps{-1};
     u64 last_sync_fence{};
 
     // Maps queued by MapInOrder and not run yet, by the GPU addresses they change.
