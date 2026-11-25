@@ -14,7 +14,10 @@
 #include <vector>
 #include "common/container/unordered_map.h"
 
+#include <span>
+
 #include "common/common_types.h"
+#include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/shader_info.h"
 #include "shader_recompiler/stage.h"
@@ -72,6 +75,26 @@ struct ConstBufferAddr {
     u32 count;
     bool has_secondary;
     u32 handle_program{~0U}; ///< index in Info::handle_programs for a handle computed per draw
+    /// Set when the dynamic offset is FindUMsb32(mask) * element_stride (+ a constant): the shader
+    /// iterates the set bits of a mask, so it reaches only element_offset + i * element_stride
+    /// for i = element_index in [0, 32). Sampled textures then get a 32-element array.
+    IR::U32 element_index{};
+    u32 element_offset{};
+    u32 element_stride{};
+    bool bindless{};         ///< the handle (`handle`) is only known at run time
+    IR::U32 handle;          ///< with `bindless`: the guest handle word, as the shader computes it
+};
+
+/// Window of 16-byte {u64 address, u32 size, u32 pad} buffer descriptors in the driver bank (c0)
+/// of an NVN2 compute program: `count` consecutive entries starting at byte `base`. NVN2 lays this
+/// bank out per compute shader (push constants, uniform entries, storage entries, ...), so the
+/// recompiler cannot assume a fixed base for it. `active == false` (every legacy environment)
+/// keeps the fixed per-stage base; an active window with `count == 0` means the program has no
+/// buffer entries at all.
+struct NvnBufferWindow {
+    u32 base{};
+    u32 count{};
+    bool active{};
 };
 
 class Environment {
@@ -86,6 +109,13 @@ public:
     /// raw 8-byte arguments in constant buffers, without the NVN descriptor layout.
     [[nodiscard]] virtual bool IsNativeProgram() const { return false; }
 
+    /// Native programs: the register remaps of the lowered code (Ampere::NativeRegisterRemap),
+    /// ordered by address. An environment holding lowered code must return them, or the
+    /// translator reads the low quartets themselves.
+    [[nodiscard]] virtual std::span<const Ampere::NativeRegisterRemap> NativeRegisterRemaps() const {
+        return {};
+    }
+
     /// Native programs: whether the 8-byte constant at (index, offset) is a mapped GPU address.
     /// Native argument tables mix pointers with scalars (sizes, strides).
     [[nodiscard]] virtual bool IsCbufStorageBufferPointer(u32, u32) { return true; }
@@ -98,6 +128,12 @@ public:
 
     /// Native programs: (index, offset) slots classified as non-pointers because they were null.
     [[nodiscard]] virtual std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const {
+        return {};
+    }
+
+    /// Native programs: pointer-table entries classified as non-pointers because they were not
+    /// mapped, as the keys of their classification.
+    [[nodiscard]] virtual std::vector<u64> UnmappedStoragePointerTableKeys() const {
         return {};
     }
 
@@ -129,6 +165,19 @@ public:
 
     [[nodiscard]] virtual std::optional<ReplaceConstant> GetReplaceConstBuffer(u32 bank,
                                                                                u32 offset) = 0;
+
+    /// Compute programs of the NVN2 HLE override this; every other environment keeps the fixed
+    /// per-stage storage buffer table.
+    [[nodiscard]] virtual NvnBufferWindow NvnComputeBufferWindow() const {
+        return {};
+    }
+
+    /// A program VTX-HLE (the NVN2 high-level emulation) replays: its driver bank (c0) is laid out
+    /// by the HLE (task and mesh stages have their own storage tables) and its storage buffers are
+    /// collected with the HLE's rules (raw global memory). The emulated GPU never sets it.
+    [[nodiscard]] virtual bool IsNvnHleProgram() const {
+        return false;
+    }
 
     virtual void Dump(u64 pipeline_hash, u64 shader_hash) = 0;
 

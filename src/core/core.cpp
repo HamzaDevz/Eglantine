@@ -51,6 +51,8 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
+#include "core/hle/nvn/bridge.h"
+#include "core/hle/nvn/hle_runtime.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/am/frontend/applets.h"
@@ -127,64 +129,6 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 }
 
 namespace {
-
-// Detect the platform before initializing the kernel memory layout and guest clock.
-bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
-    FileSys::ProgramMetadata metadata;
-    if (FileSys::NupContainer::IsNupFile(file)) {
-        FileSys::NupContainer nup{file};
-        if (nup.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        const auto base = nup.FindBasePackage();
-        const auto update = nup.FindBestUpdatePackage();
-        std::optional<std::size_t> program;
-        if (update && nup.GetExeFSDir(*update) != nullptr) {
-            program = update;
-        } else if (base && nup.GetExeFSDir(*base) != nullptr) {
-            program = base;
-        }
-        const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
-    }
-    const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
-    if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
-        const FileSys::XCI xci{file, program_id, program_index};
-        if (xci.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        const auto partition = xci.GetSecurePartitionNSP();
-        const auto program = partition != nullptr
-                                 ? partition->GetNCA(xci.GetProgramTitleID(),
-                                                     FileSys::ContentRecordType::Program)
-                                 : nullptr;
-        const auto exefs = program != nullptr ? program->GetExeFS() : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
-    }
-    if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
-        const FileSys::NSP nsp{file, program_id, program_index};
-        if (nsp.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        auto exefs = nsp.GetExeFS();
-        if (!nsp.IsExtractedType()) {
-            const auto program =
-                nsp.GetNCA(nsp.GetProgramTitleID(), FileSys::ContentRecordType::Program);
-            exefs = program != nullptr ? program->GetExeFS() : nullptr;
-        }
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
-    }
-    const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
-    const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
-    return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-           metadata.IsSwitch2();
-}
 
 /// Frame spike recorder source: every application thread's CPU ticks, counting the running
 /// thread of each core up to now (the kernel only adds a thread's time when it switches out).
@@ -431,8 +375,8 @@ struct System::Impl {
 
         const bool switch2_program =
             virtual_filesystem != nullptr &&
-            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath), params.program_id,
-                             params.program_index);
+            Loader::IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath),
+                                     params.program_id, params.program_index);
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
         Settings::SetAstcRecompressionOverride(std::nullopt);
 
@@ -564,6 +508,8 @@ struct System::Impl {
         VideoCommon::Nx2Spikes::SetGuestThreadSource({});
         debug_service.reset();
         SetShuttingDown(true);
+        Core::NvnHle::Bridge::Shutdown();
+        Core::NvnHle::Hle::Runtime::Instance().Shutdown();
         Common::ADPF::Shutdown();
 
         // Reset per-game flags
@@ -584,6 +530,7 @@ struct System::Impl {
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
+        FileSys::SetLooseAOC({});
         cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
@@ -592,6 +539,9 @@ struct System::Impl {
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();
+        // No guest thread can be inside an NVN call any more, and the renderer is gone: the
+        // Recorder (disconnected from the sink by Shutdown) and the guest memory can be freed.
+        Core::NvnHle::Hle::Runtime::Instance().Release();
         debugger.reset();
         kernel.Shutdown();
         stop_event = {};
@@ -776,6 +726,7 @@ void System::InitializeDebugger() {
 
 SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::string& filepath,
                                 Service::AM::FrontendAppletParameters& params) {
+    FileSys::SetLooseAOC({});
     return impl->Load(*this, emu_window, filepath, params);
 }
 

@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -120,6 +121,7 @@ public:
         u32 meta_size{};
 
         std::vector<u8> npdm;
+        std::vector<u8> nacp;
         std::string title_name;
         std::string publisher;
         std::string source_dump;
@@ -165,6 +167,18 @@ public:
     VirtualDir GetRomFSDir(std::size_t package_index);
     VirtualDir GetPackageDir(std::size_t package_index);
 
+    /// One usable add-on package: the newest version of a DLC title in this container.
+    struct AddonPackage {
+        u64 title_id{};
+        u32 version{};
+    };
+
+    /// Add-on packages belonging to this application, newest per DLC title, without mounting.
+    [[nodiscard]] std::vector<AddonPackage> GetAddonPackages(u64 program_id) const;
+
+    /// Newest usable add-on RomFS per title belonging to this application.
+    std::vector<std::pair<u64, VirtualFile>> GetAddonRomFS(u64 program_id);
+
     /// Stream-hashes every member file against its stored SHA-256.
     Loader::ResultStatus VerifyIntegrity(
         std::function<bool(std::size_t, std::size_t)> progress_callback) const;
@@ -192,6 +206,8 @@ private:
     bool Parse();
     bool ParseMeta(PackageInfo& package);
     bool ValidateDirTree() const;
+    /// Package index of the newest usable add-on per DLC title belonging to program_id.
+    [[nodiscard]] std::map<u64, std::size_t> SelectAddonPackages(u64 program_id) const;
     /// With serve_stand_ins, a .zs member with no zstd header is served from a sound sibling.
     void BuildDirTree(u32 dir_index, VectorVfsDirectory& out, bool serve_stand_ins);
     VirtualFile OpenFileAs(std::size_t file_index, const std::string& name);

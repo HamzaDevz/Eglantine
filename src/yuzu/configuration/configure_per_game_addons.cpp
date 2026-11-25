@@ -304,13 +304,16 @@ void ConfigurePerGameAddons::LoadConfiguration() {
     FileSys::VirtualFile update_raw;
     loader->ReadUpdateRaw(update_raw);
 
+    std::vector<std::pair<u64, u32>> packed_add_ons;
+    loader->ReadAddOnContent(packed_add_ons);
+
     const auto& disabled = Settings::values.disabled_addons[title_id];
 
     update_items.clear();
     list_items.clear();
     item_model->removeRows(0, item_model->rowCount());
 
-    std::vector<FileSys::Patch> patches = pm.GetPatches(update_raw);
+    std::vector<FileSys::Patch> patches = pm.GetPatches(update_raw, packed_add_ons);
 
     bool has_enabled_update = false;
 

@@ -14,6 +14,7 @@
 #include <string_view>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "common/cityhash.h"
 #include "common/fs/fs_util.h"
@@ -293,6 +294,7 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     pass_framebuffer = nullptr;
     dispatch_sampled.clear();
     seen_buffers.clear();
+    seen_vertex_inputs.clear();
     written_buffers.clear();
     shader_keys.clear();
     pass_index = 0;
@@ -496,28 +498,92 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
     for (BoundBuffer& buffer : buffers) {
         const size_t program = compute ? 0 : buffer.stage + 1;
         const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        const bool from_host = buffer.guest.empty();
+        // Guest-read buffers are recorded again whenever their bytes change between draws, so
+        // per-draw constants (inline cbuf writes) show the value each draw saw.
+        const u64 contents =
+            from_host ? 0
+                      : Common::CityHash64(reinterpret_cast<const char*>(buffer.guest.data()),
+                                           buffer.guest.size());
         const std::tuple<u64, bool, u32, u64, u32> key{shader, buffer.storage, buffer.index,
                                                        buffer.device_addr, buffer.size};
-        if (std::ranges::find(seen_buffers, key) != seen_buffers.end()) {
-            continue;
+        const auto seen = std::ranges::find(seen_buffers, key, &SeenBuffer::first);
+        if (seen != seen_buffers.end()) {
+            if (from_host || seen->second == contents) {
+                continue;
+            }
+            seen->second = contents;
+        } else {
+            seen_buffers.emplace_back(key, contents);
         }
-        seen_buffers.push_back(key);
         const std::string owner =
             compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
                     : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
-        const bool from_host = buffer.guest.empty();
-        std::string tags = fmt::format(
-            R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","key":"{}","type":"{}",)"
-            R"("index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}",)"
-            R"("bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
-            owner, buffer.stage, shader, KeyOf(shader), buffer.storage ? "storage" : "uniform",
-            buffer.index, buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size,
-            buffer.size, buffer.gpu_modified, from_host ? "host" : "guest");
+        const auto make_tags = [&](std::string_view source) {
+            return fmt::format(
+                R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","key":"{}","type":"{}",)"
+                R"("index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}",)"
+                R"("bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
+                owner, buffer.stage, shader, KeyOf(shader), buffer.storage ? "storage" : "uniform",
+                buffer.index, buffer.written, buffer.gpu_addr, buffer.device_addr,
+                buffer.bound_size, buffer.size, buffer.gpu_modified, source);
+        };
         if (!from_host) {
-            Enqueue({.tags = std::move(tags), .data = std::move(buffer.guest), .raw = true});
+            Enqueue({.tags = make_tags("guest"), .data = std::move(buffer.guest), .raw = true});
             continue;
         }
+        std::string tags = make_tags("host");
         recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));
+    }
+    return recorded;
+}
+
+bool FrameDump::NoteDrawInputs(std::span<const u64> shader_hashes, const DrawArgs& args,
+                               std::span<VertexInput> inputs) {
+    const auto pairs = [](std::span<const std::pair<u32, u32>> values) {
+        std::string out;
+        for (const auto& [index, word] : values) {
+            out += fmt::format("{}[{},\"{:#010x}\"]", out.empty() ? "" : ",", index, word);
+        }
+        return out;
+    };
+    std::string tags =
+        fmt::format(R"({{"kind":"draw_args","pass":{},"draw":{},{},"topology":{},"indexed":{},)"
+                    R"("vertex_first":{},"vertex_count":{},"index_first":{},"index_count":{},)"
+                    R"("index_format":{},"base_vertex":{},"base_instance":{},"instance_count":{},)"
+                    R"("attributes":[{}],"streams":[{}])",
+                    pass_index, draws - 1, ShaderList(shader_hashes), args.topology, args.indexed,
+                    args.vertex_first, args.vertex_count, args.index_first, args.index_count,
+                    args.index_format, static_cast<s32>(args.base_vertex), args.base_instance,
+                    args.instance_count, pairs(args.attributes), pairs(args.streams));
+    if (args.indirect) {
+        tags += fmt::format(
+            R"(,"indirect":"{:#x}","include_count":{},"count_addr":"{:#x}","max_draws":{},)"
+            R"("stride":{},"from_record":{},"indirect_gpu_modified":{},"indirect_words_guest":[{}])",
+            args.indirect_addr, args.include_count, args.count_addr, args.max_draws, args.stride,
+            args.from_record, args.indirect_gpu_modified, fmt::join(args.indirect_words, ","));
+    }
+    Enqueue({.tags = tags + "}"});
+
+    bool recorded = false;
+    for (VertexInput& input : inputs) {
+        const std::pair<u64, u32> key{input.device_addr, input.size};
+        if (std::ranges::find(seen_vertex_inputs, key) != seen_vertex_inputs.end()) {
+            continue;
+        }
+        seen_vertex_inputs.push_back(key);
+        const std::string common = fmt::format(
+            R"("kind":"buffer","pass":{},"draw":{},"type":"{}","slot":{},"gpu_addr":"{:#x}",)"
+            R"("device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{})",
+            pass_index, draws - 1,
+            input.slot == -2 ? "indirect" : (input.slot < 0 ? "index" : "vertex"), input.slot,
+            input.gpu_addr, input.device_addr, input.bound_size, input.size, input.gpu_modified);
+        Enqueue(
+            {.tags = common + R"(,"source":"guest")", .data = std::move(input.guest), .raw = true});
+        if (input.host != VK_NULL_HANDLE) {
+            recorded |= RecordBuffer(input.host, input.host_offset, input.size,
+                                     common + R"(,"source":"host")");
+        }
     }
     return recorded;
 }

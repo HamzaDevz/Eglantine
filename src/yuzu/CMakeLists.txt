@@ -149,6 +149,8 @@ add_executable(yuzu
     configuration/configure_ui.cpp
     configuration/configure_ui.h
     configuration/configure_ui.ui
+    configuration/configure_hd_rumble.cpp
+    configuration/configure_hd_rumble.h
     configuration/configure_vibration.cpp
     configuration/configure_vibration.h
     configuration/configure_vibration.ui
@@ -159,6 +161,8 @@ add_executable(yuzu
     configuration/input_profiles.h
     configuration/shared_widget.cpp
     configuration/shared_widget.h
+    configuration/vtx_hle_grey.cpp
+    configuration/vtx_hle_grey.h
     debugger/console.cpp
     debugger/console.h
     debugger/controller.cpp
@@ -177,7 +181,6 @@ add_executable(yuzu
     install_dialog.h
     loading_screen.cpp
     loading_screen.h
-    loading_screen.ui
 
     main.cpp
 
@@ -234,6 +237,7 @@ add_executable(yuzu
     yuzu.rc
     migration_dialog.h migration_dialog.cpp
     nup_dialogs.h nup_dialogs.cpp
+    music_extract_dialog.h music_extract_dialog.cpp
     shader_warm_dialog.h shader_warm_dialog.cpp
     migration_worker.h migration_worker.cpp
     libqt_common.h libqt_common.cpp
@@ -250,10 +254,19 @@ add_executable(yuzu
     configuration/system/profile_avatar_dialog.h configuration/system/profile_avatar_dialog.cpp
     configuration/addon/mod_select_dialog.h configuration/addon/mod_select_dialog.cpp configuration/addon/mod_select_dialog.ui
 
-    render/performance_overlay.h render/performance_overlay.cpp render/performance_overlay.ui
+    render/performance_overlay.h render/performance_overlay.cpp
+    render/perf_sampler.h render/perf_sampler.cpp
+    updater/download.h updater/download.cpp
     updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
     game/common.h
     game/carousel.h game/carousel.cpp
+    game/home_background.h game/home_background.cpp
+    game/home_customize_panel.h game/home_customize_panel.cpp
+    game/home_side_panel.h game/home_side_panel.cpp
+    game/game_details_panel.h game/game_details_panel.cpp
+    game/game_details_info.h
+    game/add_on_list.h game/add_on_list.cpp
+    game/game_artwork.h game/game_artwork.cpp
 )
 
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine")
@@ -264,6 +277,23 @@ add_custom_command(TARGET yuzu POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu>/nx2_switches.txt"
     VERBATIM)
+
+# HD Rumble ships as its own library, not linked in, so it can be left out of a build or swapped
+# for a newer one without rebuilding the emulator. On Windows it has to sit beside the executable:
+# that is where LoadLibrary looks, and the loader prefers the executable's directory precisely so a
+# user can drop in a different renhdrum.dll. RENHDRUM_DLL is the library the packager bundles;
+# RENHDRUM_LIBRARY in the environment still wins over it, and so does a file next to the exe when
+# the build embeds no path (which is the case on Windows).
+if (WIN32 AND ENABLE_RENHDRUM AND RENHDRUM_DLL)
+    if (NOT EXISTS "${RENHDRUM_DLL}")
+        message(FATAL_ERROR "RENHDRUM_DLL does not exist: ${RENHDRUM_DLL}")
+    endif()
+    add_custom_command(TARGET yuzu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${RENHDRUM_DLL}" "$<TARGET_FILE_DIR:yuzu>/renhdrum.dll"
+        COMMENT "Bundling renhdrum.dll next to the emulator"
+        VERBATIM)
+endif()
 
 if (YUZU_CRASH_DUMPS)
     target_sources(yuzu PRIVATE
@@ -290,6 +320,15 @@ file(GLOB_RECURSE THEMES ${PROJECT_SOURCE_DIR}/dist/qt_themes/*)
 
 if (ENABLE_UPDATE_CHECKER)
     target_compile_definitions(yuzu PUBLIC ENABLE_UPDATE_CHECKER)
+    target_sources(yuzu PRIVATE
+        updater/tester_build_dialog.cpp updater/tester_build_dialog.h
+        updater/tester_build_launcher.cpp updater/tester_build_launcher.h
+        updater/tester_build_monitor.cpp updater/tester_build_monitor.h
+        configuration/update_settings_panel.cpp configuration/update_settings_panel.h
+        configuration/experimental_builds_panel.cpp configuration/experimental_builds_panel.h
+        updater/tester_build_main.cpp updater/tester_build_main.h
+        updater/tester_build_runner.cpp updater/tester_build_runner.h
+        updater/version_manager_dialog.cpp updater/version_manager_dialog.h)
     target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
 endif()
 

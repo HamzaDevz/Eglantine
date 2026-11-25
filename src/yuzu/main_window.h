@@ -46,6 +46,7 @@
 #include <QFuture>
 #include <QFutureWatcher>
 #include "frontend_common/update_checker.h"
+#include "updater/tester_build_monitor.h"
 #endif
 
 class QtConfig;
@@ -376,6 +377,7 @@ private slots:
     void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);
     void OnGameListDeleteShaderWarm(u64 program_id);
     void OnGameListExtractNup(const std::string& game_path);
+    void OnGameListExtractMusic(const std::string& game_path);
     void OnGameListEditNupMetadata(const std::string& game_path);
     void OnGameListCopyTID(u64 program_id);
     void OnGameListCreateShortcut(u64 program_id, const std::string& game_path,
@@ -440,6 +442,7 @@ private slots:
     void SetTreeView();
     void SetCarouselView();
 
+    void SetGameIconSize(u32 size);
     void CheckIconSize();
     void ToggleShowGameName();
 
@@ -463,6 +466,7 @@ private slots:
 #ifdef ENABLE_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
     void OnCheckForUpdates();
+    void OnVersionManager();
 #endif
 
 private:
@@ -528,6 +532,8 @@ private:
     bool update_check_running{};
     // Set when the user asked for the check, so the result is always reported
     bool update_check_manual{};
+    // Only inside a tester build, which follows a branch or pull request instead of releases
+    std::unique_ptr<TesterBuildMonitor> tester_monitor;
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;
@@ -579,6 +585,7 @@ private:
     bool emulation_running = false;
     bool boot_in_progress = false;
     bool close_pending = false;
+    bool close_confirming = false;
 
     /// Starts the built-in MCP server if enabled by setting or command line (no-op without it).
     void MaybeStartMcpServer(bool cli_enable, std::optional<u16> cli_port, bool cli_allow_writes);

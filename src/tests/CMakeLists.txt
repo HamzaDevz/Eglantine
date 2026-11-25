@@ -56,10 +56,12 @@ add_executable(tests
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
     core/nup_writer.cpp
+    core/music_extract.cpp
     core/nup_zstd_read.cpp
     core/nx2_debug_server.cpp
     core/nx2_movie_pacing.cpp
     core/nx2_gpu_memory_registry.cpp
+    core/page_tracker.cpp
     core/priority_queue.cpp
     core/internal_network/network.cpp
     video_core/frame_dump_schedule.cpp
@@ -82,6 +84,7 @@ add_executable(tests
     video_core/shader_bench.cpp
     video_core/shader_precache.cpp
     video_core/shader_precache_identity.cpp
+    video_core/stage_cache_in_flight.cpp
     video_core/h264_packet.cpp
     video_core/vertex_repack.cpp
     video_core/virtual_range_cache.cpp
@@ -114,6 +117,61 @@ add_executable(tests
     video_core/indirect_reset.cpp
     video_core/ocarina_upscale.cpp
     input_common/calibration_configuration_job.cpp
+    common/vtx_hle_settings.cpp
+    nvn/ampere_exec.cpp
+    nvn/astc_bc.cpp
+    nvn/astc_gpu.cpp
+    nvn/backing_log.cpp
+    nvn/barrier_track.cpp
+    nvn/bridge.cpp
+    nvn/compute.cpp
+    nvn/compute_census.cpp
+    nvn/compute_legacy.cpp
+    nvn/compute_vulkan.cpp
+    nvn/condition_prefetch.cpp
+    nvn/costsplit.cpp
+    nvn/draw.cpp
+    nvn/draw_debug.cpp
+    nvn/gpu_profile.cpp
+    nvn/gpu_writes.cpp
+    nvn/hle_cmdbuf.cpp
+    nvn/hle_cmdbuf_bind.cpp
+    nvn/hle_core.cpp
+    nvn/hle_dlss.cpp
+    nvn/hle_native_image.cpp
+    nvn/hle_resources.cpp
+    nvn/hle_state.cpp
+    nvn/hle_texture.cpp
+    nvn/indirect.cpp
+    nvn/lifecycle.cpp
+    nvn/line_guard.cpp
+    nvn/memory.cpp
+    nvn/nvn_shader_containers.cpp
+    nvn/pass_state.cpp
+    nvn/pipeline_cache.cpp
+    nvn/pool_mirror.cpp
+    nvn/present_pacing.cpp
+    nvn/queue_sync.cpp
+    nvn/raw_global.cpp
+    nvn/recorder.cpp
+    nvn/rescale.cpp
+    nvn/screenshot.cpp
+    nvn/sdk_device_info.cpp
+    nvn/sdk_dlss_layout.cpp
+    nvn/sdk_impl_table.cpp
+    nvn/shaders.cpp
+    nvn/shaders_containers.cpp
+    nvn/shaders_coverage.cpp
+    nvn/shaders_position.cpp
+    nvn/sparse_layout.cpp
+    nvn/timestamps.cpp
+    nvn/types.cpp
+    nvn/uniform_snapshot.cpp
+    nvn/untile_gpu.cpp
+    nvn/vulkan.cpp
+    nvn/write_back.cpp
+    temp_path.cpp
+    temp_path.h
 )
 
 create_target_directory_groups(tests)
@@ -121,12 +179,16 @@ create_target_directory_groups(tests)
 if (ENABLE_UPDATE_CHECKER)
     target_sources(tests PRIVATE
         common/update_checker.cpp
+        common/net_heads.cpp
         common/update_installer.cpp
+        common/tester_build.cpp
         ../frontend_common/update_checker.cpp
-        ../frontend_common/update_installer.cpp)
+        ../frontend_common/update_installer.cpp
+        ../frontend_common/tester_build.cpp
+        ${CMAKE_BINARY_DIR}/src/frontend_common/tester_recipe.cpp)
 endif()
 
-target_link_libraries(tests PRIVATE common core input_common video_core)
+target_link_libraries(tests PRIVATE common core input_common video_core Opus::opus)
 
 if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)

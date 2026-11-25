@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+#include "common/progress_counter.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -19,6 +20,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/nvn/bridge.h"
 
 namespace Kernel {
 
@@ -158,7 +160,14 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         // Handle system calls.
         if (supervisor_call) {
             // Perform call.
-            Svc::Call(system, interface->GetSvcNumber());
+            const u32 svc = interface->GetSvcNumber();
+            // NVN bridge thunk SVCs (0x8000+) are handled on the host; anything else is a kernel SVC.
+            if (svc >= Core::NvnHle::Thunk::SvcBase) {
+                if (Core::NvnHle::Bridge::Handle(system, thread, *interface, svc)) {
+                    return;
+                }
+            }
+            Svc::Call(system, svc);
             return;
         }
 
@@ -247,10 +256,17 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     }
     const auto spin = std::chrono::microseconds{spin_us};
     if (spin.count() > 0) {
+        static constexpr bool idle_pause = true;
+        const KProcess* process = kernel.ApplicationProcess();
+        const bool pause = idle_pause && process != nullptr && process->IsSwitch2();
         const auto deadline = std::chrono::steady_clock::now() + spin;
         while (!m_is_interrupted.load(std::memory_order_acquire) &&
                std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
+            if (pause) {
+                Common::CpuRelax();
+            } else {
+                std::this_thread::yield();
+            }
         }
     }
     std::unique_lock lk{m_guard};

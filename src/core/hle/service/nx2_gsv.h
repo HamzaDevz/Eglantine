@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <bit>
 #include <thread>
 #include <chrono>
@@ -62,6 +63,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_transfer_memory.h"
 #include "core/hle/kernel/svc_results.h"
+#include "core/hle/nvn/hle_runtime.h"
 #include "core/memory.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/nx2_video_decoder.h"
@@ -82,6 +84,8 @@
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_movie_pacing.h"
+#include "core/hle/service/nx2_native_image_directory.h"
+#include "core/hle/service/nx2_native_pool.h"
 #include "core/hle/service/nx2_frame_interval.h"
 #include "core/hle/service/nx2_oot_time.h"
 #include "core/hle/service/sm/sm.h"
@@ -1545,37 +1549,51 @@ struct Nx2NativeObjects {
     u32 next_image{1};
 };
 
-// Block-linear layout of an InterModuleUserImagePreference (16 words): word 2 holds
-// (width - 1) | (height - 1) << 16, word 4 the block height (log2 of GOB rows), word 5 the row
-// pitch in 64-byte GOBs. Formula from changes.patch (native_image_layout.h); preferences outside
-// it fall back to 4 bytes per pixel and 128-row blocks.
-struct Nx2ImageLayout {
-    u32 width;
-    u32 height;
-    u64 pitch;
-    u32 block_height_log2;
-    u64 size;
-    u64 alignment;
-};
-
-inline Nx2ImageLayout Nx2CalculateImageLayout(const u32* preference) {
-    Nx2ImageLayout layout{};
-    layout.width = (preference[2] & 0xFFFF) + 1;
-    layout.height = (preference[2] >> 16) + 1;
-    const u64 pitch_gobs = preference[5];
-    const u32 block_height_log2 = preference[4];
-    if (block_height_log2 <= 8 && pitch_gobs >= (u64{layout.width} * 4 + 63) / 64 &&
-        pitch_gobs <= 4096) {
-        layout.pitch = pitch_gobs * 64;
-        layout.block_height_log2 = block_height_log2;
-    } else {
-        layout.pitch = Common::AlignUp(u64{layout.width} * 4, 64);
-        layout.block_height_log2 = 7;
+// What nn::gpu::sdk::QueryNativeImage (gsv 428) would be told about image `handle`, for VTX-HLE
+// (Nx2NativeImageDirectory): the descriptor QueryNativeImage builds. nullopt for a handle that
+// names no image, a decoder output image, or an image whose memory is not bound or does not hold it.
+inline std::optional<Nx2NativeImageInfo> Nx2DescribeNativeImage(Nx2NativeObjects& objects,
+                                                                u32 handle) {
+    std::scoped_lock lk{objects.mutex};
+    auto it = objects.images.upper_bound(handle);
+    if (it == objects.images.begin()) {
+        LOG_WARNING(Service, "nx2:gsv native image {} is not in the table", handle);
+        return std::nullopt;
     }
-    const u64 block_rows = u64{1} << layout.block_height_log2;
-    layout.size = layout.pitch * Common::AlignUp(u64{layout.height}, block_rows);
-    layout.alignment = std::max<u64>(64 * block_rows, 0x1000);
-    return layout;
+    --it;
+    const auto& image = it->second;
+    const u64 index = handle - it->first;
+    if (index >= image.count || image.size == 0 || image.decoder ||
+        index > (std::numeric_limits<u64>::max() - image.offset) / image.size) {
+        LOG_WARNING(Service, "nx2:gsv native image {} is not a user image of pool {} (count {})",
+                    handle, it->first, image.count);
+        return std::nullopt;
+    }
+    const u64 image_offset = image.offset + index * image.size;
+    const auto layout = Nx2CalculateImageLayout(image.preference.data());
+    const auto memory_it = objects.memories.find(image.memory);
+    if (memory_it == objects.memories.end() || memory_it->second.address == 0) {
+        LOG_WARNING(Service, "nx2:gsv native image {}: memory {} is not bound", handle, image.memory);
+        return std::nullopt;
+    }
+    if (layout.size != image.size || image_offset > memory_it->second.size ||
+        layout.size > memory_it->second.size - image_offset) {
+        LOG_WARNING(Service, "nx2:gsv native image {} ({:#x}+{:#x}) does not fit memory {} ({:#x})",
+                    handle, image_offset, layout.size, image.memory, memory_it->second.size);
+        return std::nullopt;
+    }
+    Nx2NativeImageInfo info;
+    info.address = memory_it->second.address + image_offset;
+    info.size = layout.size;
+    info.descriptor[0] = 1;
+    info.descriptor[1] = image.preference[1];
+    info.descriptor[2] = image.preference[2];
+    info.descriptor[4] = layout.block_height_log2;
+    info.descriptor[5] = static_cast<u32>(layout.pitch / 64);
+    info.descriptor[8] = 1;
+    info.descriptor[9] = 1;
+    info.descriptor[11] = static_cast<u32>(layout.size);
+    return info;
 }
 
 // GameChat's graphics side (nn::chat::gsv), handed out by gsv 1202. Read from the SDK's
@@ -1646,6 +1664,37 @@ private:
     }
 
     std::set<u32> m_logged;
+};
+
+// The session gsv 1121 returns (nn::gs::sdk::QueryApplicationGpuTimeSpan, Welcome Tour). The SDK
+// opens it once, checks it with 0(u64), which must echo the u64 back, then asks 11(u64, u64) for a
+// TimeSpan (nanoseconds) of the application's GPU time. No GPU time accounting exists here, so 11
+// answers zero.
+class INx2GpuTimeSession final : public ServiceFramework<INx2GpuTimeSession> {
+public:
+    explicit INx2GpuTimeSession(Core::System& system_) : ServiceFramework{system_, "nx2:gputime"} {
+        RegisterHandlersTipc({
+            {0, &INx2GpuTimeSession::Echo, "Check"},
+            {11, &INx2GpuTimeSession::QueryApplicationGpuTimeSpan, "QueryApplicationGpuTimeSpan"},
+        });
+    }
+
+private:
+    void Echo(HLERequestContext& ctx) {
+        TipcHandshake(ctx, "nx2:gputime");
+    }
+
+    void QueryApplicationGpuTimeSpan(HLERequestContext& ctx) {
+        const u32* w = ctx.CommandBuffer();
+        if (!m_logged) {
+            m_logged = true;
+            LOG_WARNING(Service, "(STUBBED) nx2:gputime TIPC 11 args {:#x} {:#x}, returning 0 ns",
+                        u64{w[2]} | (u64{w[3]} << 32), u64{w[4]} | (u64{w[5]} << 32));
+        }
+        TipcReplyWords(ctx, {0, 0});
+    }
+
+    bool m_logged{};
 };
 
 // Video decoder output images (nn::codec image pools, gsv 991/911/961). The preference
@@ -1966,12 +2015,13 @@ private:
 
     /// Returns presentation fences instead of blocking the present thread until the next flip.
     /// This keeps the display wait out of Wonder's CPU frame measurement.
-    /// EDEN_NX2_PRESENT_QUEUE=0 restores blocking presentation pacing.
-    static bool PresentQueue() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("EDEN_NX2_PRESENT_QUEUE");
-            return value == nullptr || value[0] != '0';
-        }();
+    /// Off by default for Ocarina of Time; EDEN_NX2_PRESENT_QUEUE=0/1 overrides.
+    bool PresentQueue() const {
+        constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+        static const char* const forced = std::getenv("EDEN_NX2_PRESENT_QUEUE");
+        const bool enabled =
+            forced != nullptr ? forced[0] != '0'
+                              : system.GetApplicationProcessProgramID() != OcarinaOfTimeProgramId;
         // Single core: CoreTiming counts guest ticks, not wall time, so the release timer would
         // not pace in real time, and DoSpeedLimiting (skipped with the queue) is the only limiter.
         return enabled && Settings::values.use_multi_core.GetValue();
@@ -2078,6 +2128,7 @@ private:
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     std::chrono::steady_clock::time_point m_next_vblank{};
+    std::chrono::nanoseconds m_next_core_vblank{};
     u32 m_swap_word{};
     Nx2OotTime::FrameDelta m_oot_frame_delta;
     Nx2FrameInterval::Controller m_frame_interval;
@@ -2176,6 +2227,11 @@ private:
         return swap_interval;
     }
 
+    bool PresentCoreClock() const {
+        static constexpr bool enabled = true;
+        return enabled && kernel.IsMulticore();
+    }
+
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
     // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
@@ -2186,6 +2242,9 @@ private:
         const auto movie_now = std::chrono::steady_clock::now();
         if (m_objects->mkw_movie_activity.Active(movie_now)) {
             m_next_vblank = movie_now;
+            if (PresentCoreClock()) {
+                m_next_core_vblank = system.CoreTiming().GetGlobalTimeNs();
+            }
             return;
         }
         const u32 swap_interval = SwapInterval(timing);
@@ -2196,6 +2255,39 @@ private:
         }
         const auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        if (PresentCoreClock()) {
+            const auto now = system.CoreTiming().GetGlobalTimeNs();
+            auto core_interval = interval;
+            std::chrono::nanoseconds phase{}, period{};
+            {
+                std::scoped_lock lk{m_vsync->mutex};
+                if (!m_vsync->events.empty()) {
+                    phase = m_vsync->phase;
+                    period = m_vsync->period;
+                }
+            }
+            const bool shared_vsync = period.count() > 0 && Settings::SpeedLimit() == 100 &&
+                                      period.count() == 1'000'000'000LL / refresh_rate;
+            if (shared_vsync) {
+                core_interval = period * swap_interval;
+                // Match the event's grid, including a rebase after pause/resume.
+                if (m_next_core_vblank == std::chrono::nanoseconds{} ||
+                    (m_next_core_vblank - phase).count() % period.count() != 0 ||
+                    now > m_next_core_vblank + core_interval) {
+                    m_next_core_vblank = now < phase ? phase - period
+                                                    : phase + period * ((now - phase) / period);
+                }
+            } else if (m_next_core_vblank == std::chrono::nanoseconds{} ||
+                       now > m_next_core_vblank + core_interval) {
+                m_next_core_vblank = now;
+            }
+            if (now < m_next_core_vblank) {
+                static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
+                    kernel, m_next_core_vblank.count() + 2));
+            }
+            m_next_core_vblank += core_interval;
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now > m_next_vblank + interval) {
             // Running slower than the swap interval: show at once and don't bank the lost time.
@@ -2849,24 +2941,34 @@ private:
 
     void StartVsyncTimer() {
         if (!m_vsync_timer) {
+            static constexpr std::chrono::nanoseconds VblankInterval{1'000'000'000LL / 60};
+            const bool core_clock = PresentCoreClock();
+            std::chrono::nanoseconds first_vblank{};
+            if (core_clock) {
+                first_vblank = system.CoreTiming().GetGlobalTimeNs() + VblankInterval;
+                std::scoped_lock lk{m_vsync->mutex};
+                m_vsync->phase = first_vblank;
+                m_vsync->period = VblankInterval;
+            }
             m_vsync_timer = Core::Timing::CreateEvent(
                 "nx2:vi2 vsync",
-                [vsync_state = m_vsync, &kernel = system.Kernel()](
-                    s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                [vsync_state = m_vsync, &kernel = system.Kernel(), core_clock](
+                    s64 scheduled, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
                     std::scoped_lock lk{vsync_state->mutex};
+                    if (core_clock) {
+                        vsync_state->phase = std::chrono::nanoseconds{scheduled};
+                    }
                     for (auto* vsync : vsync_state->events) {
                         vsync->Signal(kernel);
                     }
                     return std::nullopt;
                 });
-            // EDEN_NX2_VSYNC_HZ=<rate> (experiment): the game starts frames on this event, so a
-            // frame that misses a 60 Hz tick idles until the next one.
-            static const std::chrono::nanoseconds VblankInterval{[] {
-                const char* text = std::getenv("EDEN_NX2_VSYNC_HZ");
-                const long long hz = text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 60LL;
-                return 1'000'000'000LL / hz;
-            }()};
-            system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
+            if (core_clock) {
+                system.CoreTiming().ScheduleLoopingEvent(first_vblank, VblankInterval, m_vsync_timer,
+                                                        true);
+            } else {
+                system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
+            }
         }
     }
 
@@ -2878,6 +2980,7 @@ private:
     struct VsyncState {
         std::mutex mutex;
         std::vector<Kernel::KEvent*> events;
+        std::chrono::nanoseconds phase{}, period{};
     };
     std::shared_ptr<VsyncState> m_vsync = std::make_shared<VsyncState>();
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
@@ -3558,6 +3661,7 @@ private:
                     Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
                 system.GPU().InvalidateRegion(*device, m_tiled.size());
             }
+            Core::NvnHle::Hle::Runtime::Instance().NotifyHostWrite(address, m_tiled.size());
             return {width, height};
         }
         decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
@@ -3572,6 +3676,8 @@ private:
         if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
             system.GPU().InvalidateRegion(*device, layout.size);
         }
+        // VTX-HLE's copies of that memory (GPU-only pool buffers, texture images) follow too.
+        Core::NvnHle::Hle::Runtime::Instance().NotifyHostWrite(address, layout.size);
         return {width, height};
     }
 
@@ -3763,7 +3869,7 @@ public:
             {1111, &INx2GraphicsSystemSession::SetFeatureVersion, "SetGraphicsFrameLengthMode"},
             {1112, &INx2GraphicsSystemSession::StubReplyZeroed, "SetGraphicsFrameRestartMode"},
             {1113, &INx2GraphicsSystemSession::StubReplyZeroed, "SetGraphicsFrameGpuTimesliceMode"},
-            {1121, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1121"},
+            {1121, &INx2GraphicsSystemSession::OpenGpuTimeSession, "OpenGpuTimeSession"},
             {1203, &INx2GraphicsSystemSession::StubReplyZeroed, "DestroyChatContext"},
             {1212, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyImagePool"},
             {1501, &INx2GraphicsSystemSession::CheckPermission, "CreateInterModuleImageContext"},
@@ -3776,9 +3882,16 @@ public:
             {1612, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool1612"},
             {1691, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize1691"},
         });
+        // VTX-HLE makes its native image pools out of this session's images.
+        Nx2NativeImageDirectory::Get().Add(
+            this, [objects = std::weak_ptr<Nx2NativeObjects>{m_objects}](u32 handle) {
+                const auto locked = objects.lock();
+                return locked ? Nx2DescribeNativeImage(*locked, handle) : std::nullopt;
+            });
     }
 
     ~INx2GraphicsSystemSession() override {
+        Nx2NativeImageDirectory::Get().Remove(this);
         if (m_syncpt_memory != nullptr) {
             system.Host1x().GetSyncpointManager().SetGuestMirror({});
         }
@@ -3893,6 +4006,14 @@ private:
     void OpenChatSession(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 1202, returning a nx2:chat session");
         ReturnRawSession(system, ctx, std::make_shared<INx2ChatGsvSession>(system));
+    }
+
+    // nn::gs::sdk::QueryApplicationGpuTimeSpan opens its session with 1121() (handle at word 3,
+    // result at word 4). Auto-stubbed there was no handle, and the SDK's first request on it
+    // failed with 2001-0114 (invalid handle) and aborted Welcome Tour about 6 s into boot.
+    void OpenGpuTimeSession(HLERequestContext& ctx) {
+        LOG_INFO(Service, "nx2:gsv TIPC 1121, returning a nx2:gputime session");
+        ReturnRawSession(system, ctx, std::make_shared<INx2GpuTimeSession>(system));
     }
 
     void OpenSyncptSession(HLERequestContext& ctx) {

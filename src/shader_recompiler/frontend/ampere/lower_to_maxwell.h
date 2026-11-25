@@ -17,6 +17,7 @@
 #include <string_view>
 #include <vector>
 #include "common/common_types.h"
+#include "shader_recompiler/frontend/ampere/program_address_map.h"
 
 namespace Shader::Ampere {
 
@@ -41,6 +42,8 @@ struct LoweredProgram {
     // UR28 and up seen without a mirror: lowering again with this many registers below R216
     // reserved for them (even, so pairs stay adjacent) maps them.
     u32 high_uniform_registers{};
+    /// Registers the instructions in each range read from a high quartet (PrepareRegisterPressure).
+    std::vector<NativeRegisterRemap> register_remaps;
     u32 error_offset{};
     std::string_view error;
 
@@ -55,6 +58,9 @@ struct LoweringOptions {
     /// inline expansion (much smaller programs; see the HMMA case).
     bool compact_tensor{};
     u64 native_code_address{};
+    /// Copy high registers in and out of a low quartet around each instruction that uses them,
+    /// as before register remaps (for comparing the two forms).
+    bool register_copies{};
 };
 
 // A MOV form the Maxwell frontend reads, for lowered native programs only, as a copy between
@@ -74,16 +80,31 @@ inline bool LowerExtended() {
     return value == nullptr || value[0] != '0';
 }
 
+// EDEN_NX2_STRONG_GLOBAL_FENCE=1: LDG/STG .STRONG.GPU fenced with MEMBAR.GL on both sides
+// (Hookshot 2bbe7e183d). Off by default; part of the NVN translation key (TranslationSwitches).
+inline bool StrongGlobalFence() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_STRONG_GLOBAL_FENCE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 struct RegisterPressure {
     Instruction instruction;
     std::vector<u64> prefix, suffix;
+    /// The same mapping as remaps instead of copies: low quartet, high quartet, bank 1 components.
+    struct Group { u32 low_group, high_group, bank_mask; };
+    std::vector<Group> groups;
     bool valid = true;
 };
 
 // Native registers at or above `reserved` (the lowering's uniform mirrors and scratch) live in
-// bank 1. For one instruction, each aligned quartet of them it uses is copied into a low quartet
-// the instruction doesn't use (whose own values wait in bank 2), and copied back afterwards.
-// The copies are SSA renames: they cost nothing in the host shader.
+// bank 1. For one instruction, each aligned quartet of them it uses is renamed to a low quartet
+// the instruction doesn't use. `groups` gives that as remaps (the translator reads the high
+// registers directly); `prefix` and `suffix` as copies into the low quartet (whose own values
+// wait in bank 2) and back. The copies are SSA renames, free in the host shader but not to
+// translate: 16 to 32 instructions around every such instruction.
 inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 reserved) {
     RegisterPressure result{input};
     struct Operand { u32 bit, count; };
@@ -235,14 +256,17 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
                 used[borrow + component] = true;
             }
         }
+        u32 bank_mask = 0;
         for (u32 component = 0; component < 4; ++component) {
             const u32 low = mapped[group] + component, high = group * 4 + component;
             const u32 high_bank = high >= reserved ? 1U : 0U;
+            bank_mask |= high_bank << component;
             result.prefix.push_back(NativeRegisterCopy(2, low, 0, low));
             result.prefix.push_back(NativeRegisterCopy(0, low, high_bank, high));
             result.suffix.push_back(NativeRegisterCopy(high_bank, high, 0, low));
             result.suffix.push_back(NativeRegisterCopy(0, low, 2, low));
         }
+        result.groups.push_back({mapped[group] / 4, group, bank_mask});
     }
     for (const auto [bit, count] : operands) {
         const u32 reg = input.Bits(bit, 8);
@@ -353,7 +377,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             pressure = PrepareRegisterPressure(insn, shadow_boundary);
             if (!pressure.valid) return fail(index, "native program uses lowering scratch registers");
             insn = pressure.instruction;
-            result.instructions.insert(result.instructions.end(), pressure.prefix.begin(), pressure.prefix.end());
+            if (options.register_copies) {
+                result.instructions.insert(result.instructions.end(), pressure.prefix.begin(), pressure.prefix.end());
+            } else {
+                pressure.suffix.clear();
+            }
         }
         const size_t instruction_start = result.instructions.size();
         const size_t relocation_start = relocations.size();
@@ -1232,7 +1260,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x822: { // FSWZADD: per lane 0 = a+b, 1 = a-b, 2 = b-a, 3 = b (nvdisasm PP/PN/NP/ZP).
             const u32 swizzle = insn.words[1];
-            if (swizzle > 0xff || insn.words[2] > 255)
+            // Bit 77 is .NDV, which Eden's Maxwell FSWZADD ignores: dropped.
+            if (swizzle > 0xff || (insn.words[2] & ~0x2000U) > 255)
                 return fail(index, "native swizzled add mode");
             // Maxwell's lane codes 1 and 2 are the other way round (1 = b-a, 2 = a-b).
             const u32 maxwell = ((swizzle & 0x55) << 1) | ((swizzle & 0xaa) >> 1);
@@ -1481,14 +1510,17 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (u64{1} << 48));
             break;
         }
-        case 0xb97: { // SULD.P.2D/2D_ARRAY/3D.IGN, direct descriptor, channel mask at 72-75.
+        case 0xb97: { // SULD.P.1D/2D/2D_ARRAY/3D.IGN, direct descriptor, channel mask at 72-75.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 coordinate = insn.Bits(24, 8);
             const u32 channels = insn.Bits(72, 4);
-            const u32 dimension = insn.Bits(61, 3); // Maxwell's codes: 3 = 2D, 4 = 2D_ARRAY, 5 = 3D
-            if ((insn.words[2] & ~0xf00U) != 0x001e0000 || channels == 0 || dimension < 3 || dimension > 5 ||
-                binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || dest == 255 ||
-                coordinate > (dimension >= 4 ? 252U : 253U))
+            // Maxwell's codes: 0 = 1D, 3 = 2D, 4 = 2D_ARRAY, 5 = 3D. (Hookshot 88b554e572) 1D, one
+            // coordinate register: 17 of OoT's compute programs stopped here (1D_BUFFER and
+            // 1D_ARRAY, 1 and 2, stay refused).
+            const u32 dimension = insn.Bits(61, 3);
+            if ((insn.words[2] & ~0xf00U) != 0x001e0000 || channels == 0 || (dimension != 0 && dimension < 3) ||
+                dimension > 5 || binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || dest == 255 ||
+                coordinate > (dimension >= 4 ? 252U : dimension == 0 ? 254U : 253U))
                 return fail(index, "native formatted surface load mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return fail(index, "native surface descriptor buffer conflict");
@@ -1984,6 +2016,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (size > 6 || (opcode == 0x381 && insn.Bits(32, 8)) ||
                 (size == 5 && (dest & 1)) || (size == 6 && (dest & 3)))
                 return fail(index, "native global load mode");
+            // (Hookshot 2bbe7e183d) .STRONG.GPU ([URn+imm] with bit 78): a Maxwell LDG has no
+            // ordering, so EDEN_NX2_STRONG_GLOBAL_FENCE=1 fences it on both sides with MEMBAR.GL,
+            // as SUST.STRONG is. Off by default: it changes programs that already translate.
+            const bool strong_load = StrongGlobalFence() && opcode == 0x981 && insn.Bits(78, 1) != 0;
             if (opcode == 0x381) {
                 // Bit 77 (strong/scoped ordering) needs nothing extra from a Maxwell LDG.
                 if ((insn.words[2] & ~0x2e00U) != 0x001e8100 || (address & 1) || address >= 246)
@@ -1996,7 +2032,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 // Ra the whole address.
                 const bool descriptor_address = (insn.words[2] & ~(0x3fU | 0xe00U)) == 0x0c1e1100;
                 if ((!descriptor_address &&
-                     (insn.words[2] & ~(0x04000000U | 0x3fU | 0xe00U | 0x2000U)) != 0x081e8100) ||
+                     // (Hookshot 692a1c0f7d) bits 77-78, the load's memory ordering: nothing for a
+                     // Maxwell LDG (two of OoT's compute programs load [URn+imm] with both set).
+                     (insn.words[2] & ~(0x04000000U | 0x3fU | 0xe00U | 0x6000U)) != 0x081e8100) ||
                     uniform_address == ~0U || (uniform_address & 1))
                     return fail(index, "native global load uniform addressing mode");
                 if (descriptor_address) {
@@ -2014,8 +2052,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     address = 250;
                 }
             }
+            if (strong_load) emit(0xef98000000000000ULL | predicate | (u64{1} << 8)); // MEMBAR.GL
             emit(base(0xeed0000000000000ULL) | (u64{address} << 8) |
                  (u64{insn.Bits(40, 24)} << 20) | (u64{1} << 45) | (u64{size} << 48));
+            if (strong_load) emit(0xef98000000000000ULL | predicate | (u64{1} << 8));
             break;
         }
         case 0x386: case 0x986: { // Global store of 32/64/128 bits, 64-bit address.
@@ -2033,12 +2073,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             u32 address = insn.Bits(24, 8);
             bool extended = insn.Bits(72, 1) != 0;
+            // (.STRONG.GPU: fenced as the LDG above, with EDEN_NX2_STRONG_GLOBAL_FENCE=1)
+            const bool strong_store = StrongGlobalFence() && opcode == 0x986 && insn.Bits(78, 1) != 0;
             if (opcode == 0x986) {
                 const u32 uniform_address = uniform_register(insn.Bits(64, 6));
                 // desc[URn][Ra.64]: the uniform pair is a memory (cache policy) descriptor and
                 // Ra the whole address.
                 const bool descriptor_address = (insn.words[2] & ~(0x3fU | 0xe00U)) == 0x0c101100;
-                if ((!descriptor_address && (insn.words[2] & ~(0x04000000U | 0x3fU | 0xe00U)) != 0x0810a100) ||
+                // (Hookshot 923a334dc7) bit 78 beside 77, the store's memory ordering, as for LDG.
+                if ((!descriptor_address &&
+                     (insn.words[2] & ~(0x04000000U | 0x3fU | 0xe00U | 0x4000U)) != 0x0810a100) ||
                     uniform_address == ~0U || (uniform_address & 1) || !extended)
                     return fail(index, "native global store uniform addressing mode");
                 if (descriptor_address) {
@@ -2057,9 +2101,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             } else if ((insn.words[2] & ~0xe00U) != 0x0010a100) {
                 return fail(index, "native global store register addressing mode");
             }
+            if (strong_store) emit(0xef98000000000000ULL | predicate | (u64{1} << 8)); // MEMBAR.GL
             emit(0xeed8000000000000ULL | predicate | data |
                 (u64{address} << 8) | (u64{insn.Bits(40, 24)} << 20) |
                 (u64{extended} << 45) | (u64{size} << 48));
+            if (strong_store) emit(0xef98000000000000ULL | predicate | (u64{1} << 8));
             break;
         }
         case 0x95b: // Fragment discard; execution predicate is preserved.
@@ -2241,6 +2287,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Bit 76: a texel offset after the coordinates and level. 2D only, as Maxwell TLDS
             // 2D.LZ.AOFFI (x, y in Ra, Ra+1, offsets in Rb) or 2D.LL.AOFFI (level, offsets in Rb, Rb+1).
             const bool offsets = insn.Bits(76, 1) != 0;
+            // (Hookshot 20dd78bb58) Bit 78: a multisampled texture's texel (.MS), the sample index in
+            // Rb. 2D at level zero only, as Maxwell TLDS 2D.LZ.MS (x, y in Ra, Ra+1, the sample in
+            // Rb): three of OoT's fragment programs stopped here.
+            const bool multisample = insn.Bits(78, 1) != 0;
             const u32 dimension = insn.Bits(61, 3);
             const bool array = dimension == 5;
             const bool volume = dimension == 2;
@@ -2262,7 +2312,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 for (u32 i = 0; i < rg_masks.size(); ++i) if (rg_masks[i] == mask) swizzle = i;
             }
             if (!insn.Bits(60, 1) || (dimension != 0 && dimension != 1 && !array && !volume) ||
-                swizzle == ~0U || (insn.Bits(76, 5) & ~1U) ||
+                swizzle == ~0U || (insn.Bits(76, 5) & ~5U) ||
+                (multisample && (dimension != 1 || level || offsets || (source_a & 1) || source_a >= 254 ||
+                                 source_b == 255)) ||
                 (offsets && (dimension != 1 || (source_a & 1) || source_a >= 254 || source_b == 255 ||
                              (level && ((source_b & 1) || source_b >= 254)))) ||
                 insn.Bits(81, 3) != 7 || (insn.Bits(87, 3) != 1 && !level) || (level && volume) ||
@@ -2278,7 +2330,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             const u32 binding = insn.Bits(54, 5);
             if (!bind_texture_buffer(binding)) {
-                if (level || offsets)
+                if (level || offsets || multisample)
                     return fail(index, "native texture descriptor buffer conflict");
                 // A second descriptor buffer: TLD.B (LZ) with the coordinates in R250.. (array
                 // index or Z after Ra) and the handle, loaded from that buffer, in R253.
@@ -2326,7 +2378,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{source_b} << 20) | (u64{second_dest} << 28) |
                  (u64{insn.Bits(40, 14)} << 36) | (u64{insn.Bits(90, 1)} << 49) |
                  (u64{swizzle} << 50) |
-                 (u64{offsets ? (level ? 12U : 4U)
+                 (u64{offsets ? (level ? 12U : 4U) : multisample ? 6U
                       : array ? 8U : volume ? 7U : dimension == 0 ? (level ? 1U : 0U) : (level ? 5U : 2U)} << 53));
             break;
         }
@@ -2552,7 +2604,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                         if (op == 0xb9b || op == 0x59f || op == 0x386 || op == 0x986 ||
                             op == 0x388 || op == 0x988 || op == 0x992 || op == 0xb1d ||
                             op == 0x948 || op == 0x348 || op == 0x941 || op == 0x942 ||
-                            op == 0x95b) {
+                            op == 0x95b || op == 0xf55 || op == 0xf56) {
                             continue;
                         }
                         const u32 count = (op == 0x225 || op == 0x625 || op == 0x825 || op == 0x805) ? 2U
@@ -2628,11 +2680,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool depth_compare = insn.Bits(78, 1);
             const u32 dimension = insn.Bits(61, 3), lod = insn.Bits(87, 3);
             const u32 source_a = insn.Bits(24, 8), source_b = insn.Bits(32, 8);
-            if (!bindless && dimension == 5 && depth_compare && lod == 0 && !split && mask == 1) {
-                if (!insn.Bits(60, 1) || insn.Bits(76, 2) || insn.Bits(81, 3) != 7 ||
-                    insn.Bits(59, 1) || insn.Bits(40, 14) > 0x1fff || insn.Bits(54, 5) != 2 ||
-                    (source_a & 1) || (source_b & 1) || source_a >= 248 || source_b >= 248 || dest >= 248)
-                    return fail(index, "native array depth comparison sample mode");
+            // Depth-compared 2D array sample from descriptor buffer 2 as one Maxwell TEX. Other
+            // forms (Welcome Tour's shadow maps read descriptor buffer 4) take the general path
+            // below, which reads other buffers bindless; they were rejected here before.
+            if (!bindless && dimension == 5 && depth_compare && lod == 0 && !split && mask == 1 &&
+                insn.Bits(60, 1) && !insn.Bits(76, 2) && insn.Bits(81, 3) == 7 &&
+                !insn.Bits(59, 1) && insn.Bits(40, 14) <= 0x1fff && insn.Bits(54, 5) == 2 &&
+                !(source_a & 1) && !(source_b & 1) && source_a < 248 && source_b < 248 && dest < 248) {
                 if (!bind_texture_buffer(2)) return fail(index, "native texture descriptor buffer conflict");
                 for (u32 i = 0; i < 3; ++i) {
                     const u32 source = i < 2 ? source_a + i : source_b;
@@ -2653,8 +2707,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 constexpr std::array<u32, 8> coordinate_count{1, 2, 3, 3, 2, 3, 0, 4};
                 constexpr std::array<u32, 8> maxwell_type{0, 2, 4, 6, 1, 3, 0, 7};
                 const bool offsets = insn.Bits(76, 1) != 0;
+                // Bit 77 is .NDV, Maxwell TEX's bit 35 (FoldImageSampleImplicitLod turns a 3D
+                // TEX.NDV on FSWZADD-built coordinates into a gradient sample).
+                const u32 ndv = insn.Bits(77, 1);
                 // Bit 59 is .B, set in 0x361's encoding.
-                if (dimension == 6 || insn.Bits(77, 1) || insn.Bits(81, 3) != 7 ||
+                if (dimension == 6 || insn.Bits(81, 3) != 7 ||
                     insn.Bits(59, 1) != (opcode == 0x361 ? 1U : 0U) ||
                     (!bindless && (insn.Bits(40, 14) > 0x1fff || insn.Bits(54, 5) >= 18)) ||
                     (lod > 3 && lod != 6 && lod != 7) || (depth_compare && mask != 1) || mask == 0)
@@ -2701,13 +2758,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 if (tex_b) {
                     // Maxwell TEX.B: AOFFI at 36 and the LOD mode at 37 instead of 54 and 55.
                     emit(0xde80000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{246} << 20) |
-                         (u64{maxwell_type[dimension]} << 28) | (u64{mask} << 31) | (u64{offsets} << 36) |
-                         (u64{lod} << 37) | (u64{insn.Bits(90, 1)} << 49) | (u64{depth_compare} << 50) |
-                         (u64{7} << 51));
+                         (u64{maxwell_type[dimension]} << 28) | (u64{mask} << 31) | (u64{ndv} << 35) |
+                         (u64{offsets} << 36) | (u64{lod} << 37) | (u64{insn.Bits(90, 1)} << 49) |
+                         (u64{depth_compare} << 50) | (u64{7} << 51));
                 } else {
                 emit(0xc000000000000000ULL | predicate | 250 | (u64{250} << 8) |
                      (u64{meta == 246 ? 255U : 246U} << 20) | (u64{maxwell_type[dimension]} << 28) |
-                     (u64{mask} << 31) | (u64{insn.Bits(40, 14)} << 36) |
+                     (u64{mask} << 31) | (u64{ndv} << 35) | (u64{insn.Bits(40, 14)} << 36) |
                      (u64{insn.Bits(90, 1)} << 49) | (u64{depth_compare} << 50) | (u64{7} << 51) |
                      (u64{offsets} << 54) | (u64{lod} << 55));
                 }
@@ -2873,7 +2930,27 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0x202: // MOV register
         case 0x802: // MOV immediate
         case 0xa02: { // MOV constant buffer
-            if (insn.Bits(72, 4) != 15 || (insn.Bits(76, 16) & ~(opcode == 0xc02 ? 0x8000U : 0U))) return fail(index, "native MOV modifiers");
+            // Bits 72-75 are the quad-lane write mask. Hyrule Warriors: AoI's gloom decal shader
+            // samples once per quad lane and keeps each result in its lane with masks 1, 2, 4, 8:
+            // P6 = (laneid & 3) == k AND the guest predicate, then @P6 MOV.
+            const u32 lane_mask = insn.Bits(72, 4);
+            if (opcode == 0x202 && std::popcount(lane_mask) == 1 && !insn.Bits(76, 16) &&
+                !insn.Bits(40, 24)) {
+                const u64 guest = (predicate >> 16) & 15;
+                save_predicate();
+                emit(0xf0c8000000070000ULL | 250);                                              // S2R R250, SR_LANEID
+                emit(0x0400000000070000ULL | 250 | (u64{250} << 8) | (u64{3} << 20));         // LOP32I.AND R250, R250, 3
+                emit(0x0100000000070000ULL | 251 | (u64{15} << 12) |
+                     (u64{static_cast<u32>(std::countr_zero(lane_mask))} << 20));              // MOV32I R251, k
+                emit(0x5b60000000070000ULL | 7 | (u64{6} << 3) | (u64{250} << 8) | (u64{251} << 20) |
+                     ((guest & 7) << 39) | ((guest >> 3) << 42) | (u64{2} << 49));             // ISETP.EQ.U32.AND P6
+                emit(0x5c98000000000000ULL | (u64{6} << 16) | dest | (u64{15} << 39) |
+                     (u64{insn.Bits(32, 8)} << 20));                                           // @P6 MOV Rd, Rb
+                restore_predicate();
+                break;
+            }
+            if (lane_mask != 15 || (insn.Bits(76, 16) & ~(opcode == 0xc02 ? 0x8000U : 0U)))
+                return fail(index, "native MOV modifiers");
             if (opcode == 0x802) {
                 result.instructions.push_back(base(0x0100000000000000ULL) | (u64{15} << 12) |
                     (u64{insn.words[1]} << 20));
@@ -3224,19 +3301,24 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x217: case 0x817: case 0xa17: case 0xc17: { // IMNMX register, immediate, cbuf or uniform operand.
             if ((insn.words[2] & ~(0x04000200U | (opcode == 0xc17 ? 0x08000000U : 0U))) != 0x03800000 ||
-                (opcode == 0x817 && insn.words[1] > 0x7ffffU && insn.words[1] < 0xfff80000U) ||
                 (opcode != 0xa17 && opcode != 0x817 && insn.words[1] > 255U) ||
                 (opcode == 0xa17 && (!valid_cbuf() || insn.Bits(62, 2))))
                 return fail(index, "native integer min/max mode");
             // An immediate is a signed 20-bit value: 19 bits at 20, the sign in bit 56.
+            // (Hookshot f1f7ac8db2) A wider one (3 of OoT's vertex programs clamp to 0x7f0004)
+            // goes through R251 and the register form.
+            const bool wide = opcode == 0x817 && insn.words[1] > 0x7ffffU && insn.words[1] < 0xfff80000U;
+            if (wide) mov_imm(251, insn.words[1]);
+            const bool immediate = opcode == 0x817 && !wide;
             const u32 source = opcode == 0xc17   ? uniform_register(insn.words[1])
                                : opcode == 0xa17 ? operand(1, false)
+                               : wide            ? 251U
                                : opcode == 0x817 ? insn.words[1] & 0x7ffffU
                                                  : insn.words[1];
             if (source == ~0U) return fail(index, "native uniform min/max operand");
-            emit(base(opcode == 0x817 ? 0x3820000000000000ULL : 0x5c20000000000000ULL) |
+            emit(base(immediate ? 0x3820000000000000ULL : 0x5c20000000000000ULL) |
                  (u64{insn.Bits(24, 8)} << 8) | (u64{source} << 20) |
-                 (u64{opcode == 0x817 ? insn.words[1] >> 31 : 0U} << 56) |
+                 (u64{immediate ? insn.words[1] >> 31 : 0U} << 56) |
                  (u64{insn.Bits(87, 4)} << 39) | (u64{insn.Bits(73, 1)} << 48));
             break;
         }
@@ -3649,6 +3731,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // independently, so all three are no-ops (a SYNC would wrongly jump, and a branch
             // out of a lowered SSY region would leave its token on Eden's flow stack).
             break;
+        case 0xf55: case 0xf56:
+            // Convergence-state save/set/restore around quad-shuffle blocks (Hyrule Warriors: AoI's
+            // gloom decal shader). Like BSSY/BSYNC they only manage reconvergence: no-ops.
+            break;
         case 0x947: { // BRA
             // The offset's two low bits: .DIV (2) branches when the warp has diverged, .CONV (3)
             // when its active threads are the mask in the uniform register at 24-31 (bit 91;
@@ -3676,7 +3762,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (target < 0 || target % 16) return fail(index, "native branch destination alignment");
             relocations.push_back({static_cast<u32>(result.instructions.size()), target / 16});
             emit(0xe24000000000000fULL | branch_predicate);
-            if (computed_branch && target == s64{index} * 16 && branch_predicate == (u64{7} << 16))
+            // (Hookshot 7e1db3722c) A loop that leaves only through predicated EXITs: the program
+            // ends at the closing self-branch after the loop's unconditional jump back, which
+            // nothing falls into (one of OoT's compute programs, all its EXITs @P0).
+            const auto unconditional_jump = [&](const Instruction& before) {
+                const u32 op = before.Bits(0, 12);
+                return before.Bits(12, 4) == 7 && ((op == 0x947 && before.Bits(87, 4) == 7) || op == 0x94d);
+            };
+            const bool after_jump = index > 0 && call_targets.empty() && unconditional_jump(code[index - 1]);
+            if ((computed_branch || after_jump) && target == s64{index} * 16 &&
+                branch_predicate == (u64{7} << 16))
                 return finish(index); // the closing self-branch
             break;
         }
@@ -3742,7 +3837,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool write = opcode == 0x927;
             const u32 region = insn.Bits(76, 2);
             const bool output = insn.Bits(79, 1) != 0;
-            if ((insn.words[2] & ~0xf800U) != 0 || (region != 0 && region != 3) || write != output ||
+            // (Hookshot 67c048e068) a read may be of the output region (.O): the program reading
+            // back what it wrote (one of OoT's task programs reads its payload so); a write is
+            // always to it.
+            if ((insn.words[2] & ~0xf800U) != 0 || (region != 0 && region != 3) || (write && !output) ||
                 (!write && region != 3) || (!write && dest == 255))
                 return fail(index, "native stage buffer access mode");
             emit(0xefc0000000000000ULL | predicate | (write ? u64{insn.Bits(32, 8)} : dest) |
@@ -3832,6 +3930,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     pending.output_target = static_cast<u32>(result.instructions.size());
             }
             result.instructions.insert(result.instructions.end(), pressure.suffix.begin(), pressure.suffix.end());
+        }
+        if (!options.register_copies && result.instructions.size() > instruction_start) {
+            for (const auto& group : pressure.groups) {
+                result.register_remaps.push_back({static_cast<u32>(instruction_start),
+                                                  static_cast<u32>(result.instructions.size()),
+                                                  group.low_group, group.high_group,
+                                                  group.bank_mask});
+            }
         }
     }
     return fail(static_cast<u32>(code.size()), main_exited ? "native program lacks captured library return" : "native program has no unconditional EXIT");

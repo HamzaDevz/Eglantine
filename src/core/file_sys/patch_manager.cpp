@@ -857,7 +857,8 @@ VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs
     return romfs;
 }
 
-std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
+std::vector<Patch> PatchManager::GetPatches(
+    VirtualFile update_raw, const std::vector<std::pair<u64, u32>>& packed_add_ons) const {
     if (title_id == 0) {
         return {};
     }
@@ -1154,6 +1155,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     bool has_nand_dlc = false;
     bool has_sdmc_dlc = false;
     bool has_other_dlc = false;
+    bool has_packed_dlc = false;
     const auto dlc_entries_with_origin =
         content_union->ListEntriesFilterOrigin(std::nullopt, TitleType::AOC, ContentRecordType::Data);
 
@@ -1204,6 +1206,21 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
         dlc_match.push_back(entry);
     }
 
+    // Add-on content packed with the game's own file (e.g. inside a NUP container) has no NCA in
+    // the content provider; the loader already filtered these against the application they
+    // belong to, so list them alongside the installed entries.
+    for (const auto& [dlc_title_id, version] : packed_add_ons) {
+        if (dlc_title_id == 0 ||
+            std::any_of(dlc_match.begin(), dlc_match.end(),
+                        [dlc_title_id](const ContentProviderEntry& entry) {
+                            return entry.title_id == dlc_title_id;
+                        })) {
+            continue;
+        }
+        has_packed_dlc = true;
+        dlc_match.push_back({dlc_title_id, ContentRecordType::Data});
+    }
+
     if (!dlc_match.empty()) {
         // Ensure sorted so DLC IDs show in order.
         std::sort(dlc_match.begin(), dlc_match.end());
@@ -1223,6 +1240,9 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
             dlc_source = PatchSource::NAND;
         } else if (has_sdmc_dlc && !has_external_dlc && !has_nand_dlc && !has_other_dlc) {
             dlc_source = PatchSource::SDMC;
+        } else if (has_packed_dlc && !has_external_dlc && !has_nand_dlc && !has_sdmc_dlc &&
+                   !has_other_dlc) {
+            dlc_source = PatchSource::Packed;
         }
 
         out.push_back({.enabled = !dlc_disabled,

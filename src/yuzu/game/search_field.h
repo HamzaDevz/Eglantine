@@ -23,10 +23,14 @@ public:
 
     void clear();
     void setFocus();
+    /// Places a widget at the bar's end, before the close button.
+    void AddTrailingWidget(QWidget* widget);
 
 private:
     void changeEvent(QEvent*) override;
     void RetranslateUI();
+    void RefreshStyles();
+    void RefreshResultPalette();
 
     class KeyReleaseEater : public QObject {
     public:
@@ -42,6 +46,7 @@ private:
     };
     int visible;
     int total;
+    bool style_refresh_queued = false;
 
     QHBoxLayout* layout_filter = nullptr;
     QTreeView* tree_view = nullptr;

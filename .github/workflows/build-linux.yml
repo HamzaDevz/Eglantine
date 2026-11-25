@@ -1,7 +1,8 @@
 name: build-linux
 
-# Reusable: builds the Linux binaries (x86_64 and aarch64; with pgo=both also the clang PGO
-# variants) and uploads one artifact per platform holding the tar.gz and the AppImage.
+# Reusable: builds the Linux binaries (x86_64 and aarch64, or the arch input's subset;
+# with pgo=both also the clang PGO variants) and uploads one artifact per platform
+# holding the tar.gz and the AppImage.
 on:
   workflow_call:
     inputs:
@@ -31,10 +32,18 @@ on:
       nightly:
         type: boolean
         default: true
+      arch:
+        description: Architectures to build (both, x86_64 or aarch64)
+        type: string
+        default: both
       pgo:
         description: none or both
         type: string
         default: none
+      follow_branch:
+        description: Branch this build follows for tester builds; empty for builds that do not
+        type: string
+        default: ""
       save_cache:
         description: Force-save the compiler and CPM caches at the end of the job
         type: boolean
@@ -60,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        arch: ${{ fromJSON(inputs.arch == 'aarch64' && '["aarch64"]' || (inputs.arch == 'x86_64' && '["x86_64"]' || '["x86_64","aarch64"]')) }}
         pgo: ${{ fromJSON(inputs.pgo == 'only' && '[true]' || (inputs.pgo == 'both' && '[false, true]' || '[false]')) }}
 
     steps:
@@ -161,6 +170,9 @@ jobs:
 
       - name: Configure
         shell: bash
+        env:
+          FOLLOW_BRANCH: ${{ inputs.follow_branch }}
+          UPDATE_CHECKER: ${{ (inputs.release || startsWith(inputs.tag, 'daily-')) && 'ON' || (inputs.follow_branch != '' && 'ON') || 'OFF' }}
         run: |
           set -euo pipefail
           flags=(
@@ -178,9 +190,10 @@ jobs:
             -DVulkanHeaders_FORCE_BUNDLED=ON
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
             -DENABLE_QT_TRANSLATION=ON
-            -DENABLE_UPDATE_CHECKER=${{ (inputs.release || startsWith(inputs.tag, 'daily-')) && 'ON' || 'OFF' }}
+            "-DENABLE_UPDATE_CHECKER=$UPDATE_CHECKER"
             -DEGLANTINE_UPDATE_REPO=${{ github.repository }}
             -DEGLANTINE_RELEASE_PLATFORM=${{ env.PLATFORM }}
+            "-DEGLANTINE_FOLLOW_BRANCH=$FOLLOW_BRANCH"
             -DUSE_DISCORD_PRESENCE=ON
             -DUSE_CCACHE=ON
             -DNIGHTLY_BUILD=${{ inputs.nightly && 'ON' || 'OFF' }}

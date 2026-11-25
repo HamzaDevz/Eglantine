@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -354,6 +355,55 @@ struct Values {
 #endif
         "backend", Category::Renderer};
     SwitchableSetting<u32> vulkan_device{linkage, 0, "vulkan_device", Category::Renderer, Specialization::RuntimeList};
+    // Which GPU path runs a Switch 2 game's NVN graphics: the emulated Maxwell GPU (the default)
+    // or VTX-HLE, the NVN high-level emulation. Read when the game boots (the NVN hooks and the
+    // Vulkan device features depend on it), so it is not runtime modifiable. See ResolveNvnHle().
+    SwitchableSetting<GraphicsPath> graphics_path{linkage,
+                                                  GraphicsPath::Emulated,
+                                                  "graphics_path",
+                                                  Category::Renderer,
+                                                  Specialization::Default,
+                                                  true,
+                                                  false};
+    // VTX-HLE: occlusion queries run inside render passes, so a result the game
+    // asks for no longer ends the pass (needs Vulkan's host query reset). Read when the NVN
+    // context starts. On: OoT's ~2000 reports a frame ended as many passes (VTX-HLE 7.7 -> 9.9 fps).
+    SwitchableSetting<bool> nvn_in_pass_queries{linkage,
+                                                true,
+                                                "nvn_in_pass_queries",
+                                                Category::Renderer,
+                                                Specialization::Default,
+                                                true,
+                                                false};
+    // VTX-HLE: graphics pipelines are built from VK_EXT_graphics_pipeline_library parts that are
+    // compiled once and fast-linked while the whole pipeline is compiled in the background. With
+    // use_asynchronous_shaders the parts and links of draws that may be skipped run on the async
+    // workers (the draw waits), else on the replay thread. Read when the Vulkan device and the
+    // NVN pipeline cache are created.
+    SwitchableSetting<bool> nvn_pipeline_library{linkage,
+                                                 false,
+                                                 "nvn_pipeline_library",
+                                                 Category::Renderer,
+                                                 Specialization::Default,
+                                                 true,
+                                                 false};
+    // VTX-HLE: a render pass carries no external subpass dependencies (each was a full
+    // ALL_COMMANDS sync before and after the pass); the replay's explicit barrier between a pass
+    // and the next op stays the one sync at the boundary. Read when the NVN pipeline cache is
+    // created (its render passes are made with it). See nvn/DESIGN.md "Pass boundary syncs".
+    SwitchableSetting<bool> nvn_sync_diet{linkage,
+                                          true,
+                                          "nvn_sync_diet",
+                                          Category::Renderer,
+                                          Specialization::Default,
+                                          true,
+                                          false};
+
+    // VTX-HLE diagnostic/workaround: start without disk caches and recompile shaders every minute.
+    // Read at game start; synchronous compilation keeps the refresh from losing one-time draws.
+    SwitchableSetting<bool> nvn_shader_refresh{
+        linkage, false, "nvn_shader_refresh", Category::Renderer, Specialization::Default,
+        true,    false};
 
     // Graphics Settings
     ResolutionScalingInfo resolution_info{};
@@ -522,6 +572,8 @@ struct Values {
                                                             Specialization::Default,
                                                             true,
                                                             true};
+    SwitchableSetting<bool> fullscreen_on_launch{linkage, false, "fullscreen_on_launch",
+                                                 Category::Renderer};
 
     SwitchableSetting<u8, false> bg_red{
                                         linkage, 0, "bg_red", Category::Renderer, Specialization::Default, true, true};
@@ -609,6 +661,12 @@ struct Values {
                                                                   "astc_recompression",
                                                                   Category::RendererAdvanced};
 
+    // VTX-HLE only: with the BC3 stand-in kind, hold each ASTC texture in the BC format its
+    // channels need (BC4 luminance, BC5 luminance+alpha, BC1 opaque colour, BC3 the rest) instead
+    // of BC3 everywhere. EDEN_NX2_NVN_SMART_BC overrides it; the parts have their own env switches.
+    SwitchableSetting<bool> nvn_smart_bc{linkage, true, "nvn_smart_bc",
+                                         Category::RendererAdvanced};
+
 
     SwitchableSetting<bool> sync_memory_operations{linkage,
                                                    false,
@@ -628,11 +686,22 @@ struct Values {
         linkage, true, "use_vulkan_driver_pipeline_cache", Category::RendererAdvanced,
         Specialization::Default};
 
-    // Off: task/mesh draws take the compute fallback even when the device has VK_EXT_mesh_shader.
-    SwitchableSetting<bool> use_mesh_shaders{linkage, true, "use_mesh_shaders",
-                                             Category::RendererAdvanced};
+    // How task/mesh draws run on a device with VK_EXT_mesh_shader: Native uses its task and mesh
+    // stages, ComputeFallback the compute path a device without it uses, Auto the fallback on AMD
+    // drivers and the native stages elsewhere (Vulkan::Device::RemoveUnsuitableExtensions).
+    // Replaces the use_mesh_shaders bool; Config::MigrateMeshShaderSetting maps its old value.
+    SwitchableSetting<MeshShaderMode> mesh_shader_mode{linkage, MeshShaderMode::Auto,
+                                                       "mesh_shader_mode",
+                                                       Category::RendererAdvanced};
 
-    // Linux: the GPU driver's shader cache in a folder of our own (ConfigureDriverShaderCache),
+    // VK_EXT_graphics_pipeline_library: graphics pipelines that share shaders link library
+    // parts compiled once (vk_pipeline_library). Off while it is measured; EDEN_NX2_GPL=0/1
+    // overrides it. Applied when the Vulkan device is created (game start).
+    SwitchableSetting<bool> graphics_pipeline_library{linkage, false, "graphics_pipeline_library",
+                                                      Category::RendererAdvanced};
+
+    // Linux: the NVIDIA or Mesa driver's shader cache in a folder of our own
+    // (ConfigureDriverShaderCache),
     // with its size limit in GiB. Applied at startup, before anything loads a driver.
     Setting<bool> private_driver_shader_cache{linkage, true, "private_driver_shader_cache",
                                               Category::RendererAdvanced, Specialization::Paired};
@@ -833,7 +902,7 @@ struct Values {
                                     linkage, 0,    "rng_seed",       Category::System, Specialization::Hex,
                                     true,    true, &rng_seed_enabled};
     Setting<std::string> device_name{
-        linkage, "Eden", "device_name", Category::System, Specialization::Default, true, true};
+        linkage, "Eglantine", "device_name", Category::System, Specialization::Default, true, true};
 
     Setting<s32> current_user{linkage, 0, "current_user", Category::System};
 
@@ -873,6 +942,69 @@ struct Values {
                                               Category::Controls};
     SwitchableSetting<bool> enable_accurate_vibrations{linkage, false, "enable_accurate_vibrations",
                                                        Category::Controls};
+
+    // RenHDrum HD Rumble (Switch Pro Controller / Joy-Con) and DualSense haptics. Defaults are
+    // Ryuhdr 0.2.6's recommended mode. Read by the SDL driver on every vibration, so a change in
+    // the HD Rumble dialog applies to connected controllers right away.
+    Setting<bool> hd_rumble_enabled{linkage, true, "hd_rumble_enabled", Category::Controls};
+    // Switch 2 rumble Mode last sent by the guest (commands 213 / 214): 2 = Mode 2, anything else
+    // is played as Switch 1. Written by the HID service, read by the RenHDrum pad driver. Not a
+    // user setting and not saved.
+    std::atomic<int> nx2_active_mode{0};
+    // Set by the input layer when the RenHDrum library is actually loaded; never saved. HD Rumble
+    // can be enabled in the config with no library next to the emulator, in which case the standard
+    // rumble runs and the 15 ms packet filter has to stay in place.
+    Setting<bool> renhdrum_available{linkage, false, "renhdrum_available", Category::Controls,
+                                     Specialization::Default, false};
+    // Amplitude gain in percent for everything RenHDrum plays. Switchable: some Switch 2 games
+    // (Ocarina of Time) send amplitudes below 0.1 that the Joy-Con 2 still plays strongly.
+    SwitchableSetting<int> hd_rumble_gain{linkage, 100, "hd_rumble_gain", Category::Controls};
+    // 0-100: lifts weak vibrations more than strong ones (power curve after the gain).
+    SwitchableSetting<int> hd_rumble_low_boost{linkage, 0, "hd_rumble_low_boost",
+                                               Category::Controls};
+    Setting<int> hd_rumble_usb_interval_ms{linkage, 15, "hd_rumble_usb_interval_ms", Category::Controls};
+    Setting<bool> hd_rumble_envelope_5ms{linkage, true, "hd_rumble_envelope_5ms",
+                                         Category::Controls};
+    Setting<bool> hd_rumble_frequency_in_packet{linkage, true, "hd_rumble_frequency_in_packet",
+                                                Category::Controls};
+    Setting<bool> hd_rumble_crisp_notes{linkage, true, "hd_rumble_crisp_notes",
+                                        Category::Controls};
+    Setting<int> hd_rumble_bluetooth_level{linkage, 3, "hd_rumble_bluetooth_level", Category::Controls};
+    Setting<bool> hd_rumble_bt_after_input{linkage, true, "hd_rumble_bt_after_input",
+                                           Category::Controls};
+    Setting<bool> hd_rumble_bt_fast{linkage, true, "hd_rumble_bt_fast", Category::Controls};
+    Setting<bool> hd_rumble_bt_crisp_notes{linkage, true, "hd_rumble_bt_crisp_notes",
+                                           Category::Controls};
+    // RenHDrum 0.5.0 options-table rows that had no Eglantine setting yet.
+    // Bluetooth basic mode: 0 = Detailed (5 ms envelope), 1 = Compatible (plain, every adapter).
+    Setting<int> hd_rumble_bt_mode{linkage, 0, "hd_rumble_bt_mode", Category::Controls};
+    // Transport switches. usb_no_queue and auto_slow only bite with the patched SDL transport;
+    // with stock SDL the driver clears them, as it already does for the transport modes.
+    Setting<bool> hd_rumble_usb_no_queue{linkage, true, "hd_rumble_usb_no_queue",
+                                         Category::Controls};
+    Setting<bool> hd_rumble_frequency_both_bands{linkage, true, "hd_rumble_frequency_both_bands",
+                                                 Category::Controls};
+    Setting<bool> hd_rumble_usb_auto_slow{linkage, true, "hd_rumble_usb_auto_slow",
+                                          Category::Controls};
+    // RenHDrum 0.5.0 HD Haptics: the controller speaker and the L2/R2 trigger kick react to the
+    // rumble. Host-side only: the speaker and trigger blocks are sent by the pad driver.
+    Setting<bool> dualsense_hd_haptics{linkage, true, "dualsense_hd_haptics", Category::Controls};
+    Setting<int> dualsense_speaker_volume{linkage, 60, "dualsense_speaker_volume",
+                                          Category::Controls};
+    Setting<bool> dualsense_haptics_enabled{linkage, true, "dualsense_haptics_enabled",
+                                            Category::Controls};
+    Setting<int> dualsense_haptics_volume{linkage, 100, "dualsense_haptics_volume", Category::Controls};
+    Setting<bool> dualsense_crisp_notes{linkage, true, "dualsense_crisp_notes",
+                                        Category::Controls};
+    Setting<bool> xbox_rumble_enabled{linkage, true, "xbox_rumble_enabled", Category::Controls};
+    Setting<int> xbox_motor_strength{linkage, 100, "xbox_motor_strength", Category::Controls};
+    // 0: RenHDrum's four-motor mix, 1: direct (low band to the big motor, high band to the small)
+    Setting<int> xbox_rumble_mode{linkage, 0, "xbox_rumble_mode", Category::Controls};
+    // Direct mode: share of the high band added to the big motor, and the kick on a sudden rise
+    Setting<int> xbox_detail_mix{linkage, 50, "xbox_detail_mix", Category::Controls};
+    Setting<int> xbox_hit_accents{linkage, 50, "xbox_hit_accents", Category::Controls};
+    // Direct mode: share of the high band sent to the trigger motors (left side LT, right RT)
+    Setting<int> xbox_trigger_mix{linkage, 20, "xbox_trigger_mix", Category::Controls};
 
     SwitchableSetting<bool> motion_enabled{linkage, true, "motion_enabled", Category::Controls};
     Setting<std::string> udp_input_servers{linkage, "127.0.0.1:26760", "udp_input_servers",
@@ -1062,6 +1194,28 @@ u64 GetCurrentProgramID();
 void SetCurrentProgramIsSwitch2(bool is_switch2);
 bool CurrentProgramIsSwitch2();
 
+// Why the NVN high-level emulation is on or off for the program being started.
+enum class NvnHleReason {
+    EnvironmentOn,   // EDEN_NX2_NVN_HLE set to anything but "0": on for any program
+    EnvironmentOff,  // EDEN_NX2_NVN_HLE=0
+    SettingHle,      // graphics_path = HLE and the program is a Switch 2 one
+    SettingEmulated, // graphics_path = Emulated GPU
+    NotSwitch2,      // graphics_path = HLE, but the HLE only exists for the Switch 2 NVN SDK
+};
+struct NvnHleChoice {
+    bool hle{};
+    NvnHleReason reason{NvnHleReason::SettingEmulated};
+};
+// Pure form (tests): `environment` is the value of EDEN_NX2_NVN_HLE (nullptr when unset).
+[[nodiscard]] NvnHleChoice ChooseNvnHle(const char* environment, GraphicsPath setting,
+                                        bool switch2_program);
+// The choice for the program being started: EDEN_NX2_NVN_HLE (1/0) overrides the graphics_path
+// setting; Switch 1 programs always use the emulated GPU unless the variable forces the HLE.
+// Valid once SetCurrentProgramIsSwitch2 was called for the program (the core does it before the
+// GPU is created) and until it ends.
+[[nodiscard]] NvnHleChoice ResolveNvnHle();
+[[nodiscard]] const char* NvnHleReasonText(NvnHleReason reason);
+
 // The ASTC recompression in effect: astc_recompression, unless the renderer picked another one
 // for the running program (the configuration is left as is). The core clears it on load.
 AstcRecompression GetAstcRecompression();
@@ -1079,6 +1233,8 @@ float Volume();
 
 // speed limit ops
 u16 SpeedLimit();
+// The frame rate frame_pacing_mode caps the game at (0: none). VTX-HLE paces its presents with it.
+u32 FrameRateCap();
 void SetSpeedMode(const SpeedMode &mode);
 void ToggleStandardMode();
 void ToggleTurboMode();

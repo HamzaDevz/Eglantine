@@ -45,6 +45,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/native_tensor_programs.h"
 
 namespace Tegra::Engines {
 
@@ -399,6 +400,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
+                if (const auto device = memory_manager.GpuToCpuAddress(address);
+                    device && (flags & ((1U << 26) | (1U << 19)))) {
+                    Tegra::Nx2SemaphoreWaiters::Get().Note(
+                        *device, payload, Tegra::Nx2SemaphoreWaiters::Event::Queued);
+                }
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload, flags] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
@@ -940,13 +946,12 @@ bool KeplerCompute::EmulatesNativeTensorPrograms() const {
         return dlss_chain.failure == VideoCore::GameDlssReason::None &&
                GameDlssBlocker() == VideoCore::GameDlssReason::None;
     }
-    // Donkey Kong Bananza's programs are emulated: rejected, they write nothing and the screen is
-    // purple from its mode select on. Ocarina of Time's end-of-frame network is emulated in the
-    // compact form (UsesCompactTensorPrograms). Other titles keep the upscale stand-in (emulating
-    // title 4's network takes the host driver minutes to compile). Chosen per title, not per
-    // dispatch: the shader cache keeps the result of a program's first dispatch.
-    constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
-    return Settings::GetCurrentProgramID() == DonkeyKongBananzaProgramId ||
+    // The titles VideoCommon::LowersNativeTensorPrograms names; the compact ones only in the
+    // compact form (UsesCompactTensorPrograms). Other titles keep the upscale stand-in. Chosen per
+    // title, not per dispatch: the shader cache keeps the result of a program's first dispatch.
+    const u64 program_id = Settings::GetCurrentProgramID();
+    return (VideoCommon::LowersNativeTensorPrograms(program_id) &&
+            !VideoCommon::UsesCompactNativeTensorPrograms(program_id)) ||
            UsesCompactTensorPrograms();
 }
 
@@ -955,8 +960,8 @@ bool KeplerCompute::UsesCompactTensorPrograms() const {
     // stand-in blits the network's input instead, which leaves the frame flat and far too bright
     // (Kokiri Forest median luma ~0.29 against ~0.10 with the network). The compact form calls a
     // helper that shuffles across 32 lanes, so it needs compute shaders created 32 threads wide.
-    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
-    return !dlss_chain.active && Settings::GetCurrentProgramID() == OcarinaOfTimeProgramId &&
+    return !dlss_chain.active &&
+           VideoCommon::UsesCompactNativeTensorPrograms(Settings::GetCurrentProgramID()) &&
            rasterizer != nullptr && rasterizer->SupportsGameDlssNetwork();
 }
 
@@ -2117,8 +2122,9 @@ VideoCommon::SplitWriteTracker::Effect KeplerCompute::FrontEffect(u32 method) co
     case 0xaf:
     case 0xb0:
     case 0x107:
-    case 0x6c3:
         return Effect::Gpu; // QMD launches and the semaphore releases after them
+    case 0x6c3:
+        return VideoCommon::GpuSplit::AcquireKnownReleaseEnabled() ? Effect::None : Effect::Gpu;
     default:
         return Effect::Unknown; // Inline uploads among them
     }
@@ -2128,11 +2134,22 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
     if (method == 0x107) {
         // An inline QMD is written to memory before it launches.
         const GPUVAddr qmd = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
-        split.NoteWrite(memory_manager, qmd, 256);
+        split.NoteWrite(memory_manager, qmd, 256, VideoCommon::GpuSplit::WriteKind::Other);
     } else if (method == 0x6c3) {
-        split.NoteWrite(memory_manager,
-                        (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1],
-                        16);
+        const GPUVAddr address =
+            (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+        const u32 control = fs.registers[0x6c3];
+        if (!VideoCommon::GpuSplit::AcquireKnownReleaseEnabled()) {
+            split.NoteWrite(memory_manager, address, 16, VideoCommon::GpuSplit::WriteKind::Other);
+            return;
+        }
+        const u32 operation = control & 3;
+        const bool payload = address != 0 && (operation == 0 || operation == 2) &&
+                             (control & (1U << 3)) == 0;
+        split.NoteRelease(memory_manager, address, (control & (1U << 28)) != 0 ? 4 : 16,
+                          fs.registers[0x6c2],
+                          payload && VideoCommon::GpuSplit::PayloadReleaseSynchronous(
+                                         (control & (1U << 28)) != 0));
     }
 }
 
@@ -2164,6 +2181,14 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
                       FrontEffect(method));
     FrontNoteWrites(split, fs, method);
+    if (method == 0x6c3 && amount > 1 &&
+        VideoCommon::GpuSplit::AcquireKnownReleaseEnabled()) {
+        const GPUVAddr address =
+            (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            split.NoteAsyncWrite(*device, 16);
+        }
+    }
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -2192,9 +2217,14 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     if (!macro.native_jit) {
         macro.native_jit = std::make_shared<TuringMacroJit>();
     }
-    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
+    static constexpr bool batch_macros = true;
+    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation, batch_macros);
+    // Buffered emits flush before register reads, DMA emits and return.
+    const TuringMacroJit::Options jit_options{.batch_emits = batch_macros,
+                                             .keep_state = batch_macros};
     const auto result = macro.native_jit->Execute(
-        start, fs.parameters, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit);
+        start, fs.parameters, {}, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit,
+        jit_options);
     if (!result.success) {
         macro.native_execution_failed = true;
         LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: compute start={:#x}, consumed={}, error={}",

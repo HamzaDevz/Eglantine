@@ -9,10 +9,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <span>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
@@ -238,6 +244,16 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
            Shader::NumDescriptors(info.image_descriptors);
 }
 
+/// The layouts of a pipeline. Creating them waits on a driver lock while other pipelines
+/// compile (2.8 ms each in Ocarina of Time's load burst), so graphics pipelines with the same
+/// descriptor layout share one (PipelineLayoutCache).
+struct PipelineLayouts {
+    vk::DescriptorSetLayout set_layout;
+    DescriptorBufferLayout buffer_layout;
+    vk::PipelineLayout pipeline_layout;
+    vk::DescriptorUpdateTemplate update_template;
+};
+
 class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
@@ -336,6 +352,33 @@ public:
             .set = 0,
         });
     }
+
+    /// The builder a LayoutKey describes, with the descriptor choices it was made with: for
+    /// creating saved layouts at boot. Nothing for keys this device can't create.
+    struct FromKeyResult;
+    [[nodiscard]] static std::optional<FromKeyResult> FromKey(const Device& device,
+                                                              std::span<const u32> key);
+
+    /// Everything the layouts it creates depend on (CreateLayouts), for sharing them.
+    [[nodiscard]] std::vector<u32> LayoutKey(bool use_push_descriptor,
+                                             bool use_descriptor_buffer) const {
+        std::vector<u32> key;
+        key.reserve(1 + bindings.size() * 4);
+        key.push_back(u32{use_push_descriptor} | u32{use_descriptor_buffer} << 1 |
+                      u32{is_compute} << 2 | u32{uses_mesh} << 3 | u32{mesh_emulation} << 4);
+        for (const VkDescriptorSetLayoutBinding& entry : bindings) {
+            key.push_back(entry.binding);
+            key.push_back(static_cast<u32>(entry.descriptorType));
+            key.push_back(entry.descriptorCount);
+            key.push_back(entry.stageFlags);
+        }
+        return key;
+    }
+
+    /// The set layout, the descriptor buffer layout (with descriptor buffers), the pipeline
+    /// layout and the update template (without).
+    [[nodiscard]] std::shared_ptr<PipelineLayouts> CreateLayouts(bool use_push_descriptor,
+                                                                 bool use_descriptor_buffer) const;
 
     vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
@@ -442,6 +485,122 @@ private:
     size_t offset{};
 };
 
+struct DescriptorLayoutBuilder::FromKeyResult {
+    DescriptorLayoutBuilder builder;
+    bool use_push_descriptor;
+    bool use_descriptor_buffer;
+};
+
+inline std::optional<DescriptorLayoutBuilder::FromKeyResult> DescriptorLayoutBuilder::FromKey(
+    const Device& device, std::span<const u32> key) {
+    if (key.empty() || (key.size() - 1) % 4 != 0) {
+        return std::nullopt;
+    }
+    const u32 flags = key[0];
+    FromKeyResult result{DescriptorLayoutBuilder{device}, (flags & 1) != 0, (flags & 2) != 0};
+    DescriptorLayoutBuilder& builder = result.builder;
+    builder.is_compute = (flags & 4) != 0;
+    builder.uses_mesh = (flags & 8) != 0;
+    if ((flags & 16) != 0 || (flags & ~31U) != 0 || builder.is_compute ||
+        (builder.uses_mesh && !device.IsExtMeshShaderSupported())) {
+        return std::nullopt;
+    }
+    for (size_t index = 1; index < key.size(); index += 4) {
+        const u32 count = key[index + 2];
+        builder.bindings.push_back({
+            .binding = key[index],
+            .descriptorType = static_cast<VkDescriptorType>(key[index + 1]),
+            .descriptorCount = count,
+            .stageFlags = key[index + 3],
+            .pImmutableSamplers = nullptr,
+        });
+        builder.entries.push_back({
+            .dstBinding = key[index],
+            .dstArrayElement = 0,
+            .descriptorCount = count,
+            .descriptorType = static_cast<VkDescriptorType>(key[index + 1]),
+            .offset = builder.offset,
+            .stride = sizeof(DescriptorUpdateEntry),
+        });
+        builder.binding = (std::max)(builder.binding, key[index] + 1);
+        builder.num_descriptors += count;
+        builder.offset += sizeof(DescriptorUpdateEntry) * count;
+    }
+    if ((result.use_push_descriptor && !builder.CanUsePushDescriptor()) ||
+        (result.use_descriptor_buffer && !builder.CanUseDescriptorBuffer())) {
+        return std::nullopt;
+    }
+    return result;
+}
+
+inline std::shared_ptr<PipelineLayouts> DescriptorLayoutBuilder::CreateLayouts(
+    bool use_push_descriptor, bool use_descriptor_buffer) const {
+    auto layouts = std::make_shared<PipelineLayouts>();
+    layouts->set_layout = CreateDescriptorSetLayout(use_push_descriptor, use_descriptor_buffer);
+    if (use_descriptor_buffer) {
+        layouts->buffer_layout = MakeDescriptorBufferLayout(*layouts->set_layout);
+    }
+    layouts->pipeline_layout = CreatePipelineLayout(*layouts->set_layout);
+    if (!use_descriptor_buffer) {
+        layouts->update_template =
+            CreateTemplate(*layouts->set_layout, *layouts->pipeline_layout, use_push_descriptor);
+    }
+    return layouts;
+}
+
+/// Layouts shared by the graphics pipelines that describe the same ones (LayoutKey).
+class PipelineLayoutCache {
+public:
+    [[nodiscard]] std::shared_ptr<const PipelineLayouts> Get(const DescriptorLayoutBuilder& builder,
+                                                             bool use_push_descriptor,
+                                                             bool use_descriptor_buffer) {
+        std::vector<u32> key = builder.LayoutKey(use_push_descriptor, use_descriptor_buffer);
+        {
+            std::scoped_lock lock{mutex};
+            if (const auto it = layouts.find(key); it != layouts.end()) {
+                ++shared;
+                return it->second;
+            }
+        }
+        // Created without the lock; a thread that lost the race uses the first one.
+        std::shared_ptr<const PipelineLayouts> made =
+            builder.CreateLayouts(use_push_descriptor, use_descriptor_buffer);
+        std::scoped_lock lock{mutex};
+        const auto [it, inserted] = layouts.try_emplace(std::move(key), std::move(made));
+        ++(inserted ? created : shared);
+        return it->second;
+    }
+
+    /// Layouts created and pipelines that found theirs already there.
+    [[nodiscard]] std::pair<u64, u64> Counts() {
+        std::scoped_lock lock{mutex};
+        return {created, shared};
+    }
+
+    /// Adds layouts made ahead of time (saved ones, at boot).
+    void Insert(std::vector<u32> key, std::shared_ptr<const PipelineLayouts> made) {
+        std::scoped_lock lock{mutex};
+        layouts.try_emplace(std::move(key), std::move(made));
+    }
+
+    /// The keys of every layout, for saving them.
+    [[nodiscard]] std::vector<std::vector<u32>> Keys() {
+        std::scoped_lock lock{mutex};
+        std::vector<std::vector<u32>> keys;
+        keys.reserve(layouts.size());
+        for (const auto& [key, made] : layouts) {
+            keys.push_back(key);
+        }
+        return keys;
+    }
+
+private:
+    u64 created{};
+    u64 shared{};
+    std::mutex mutex;
+    std::map<std::vector<u32>, std::shared_ptr<const PipelineLayouts>> layouts;
+};
+
 class RescalingPushConstant {
 public:
     explicit RescalingPushConstant() noexcept {}
@@ -482,21 +641,39 @@ public:
     std::array<f32, 4> words{};
 };
 
+template <bool HasTextureBuffers = true, bool HasImageBuffers = true, bool HasImages = true>
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
                                  const VideoCommon::ImageViewInOut*& views) {
-    const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
-    const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
-    views += num_texture_buffers;
-    views += num_image_buffers;
+    if constexpr (HasTextureBuffers) {
+        views += Shader::NumDescriptors(info.texture_buffer_descriptors);
+    }
+    if constexpr (HasImageBuffers) {
+        views += Shader::NumDescriptors(info.image_buffer_descriptors);
+    }
     const bool rescaling_active{Settings::values.resolution_info.active};
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
+        // Dynamically indexed bindless tables are sized to the most a constant buffer could hold
+        // (1024 entries; Welcome Tour binds two or three per pipeline) and are mostly zero
+        // handles, which resolve to the same view and sampler over and over. An entry equal to
+        // the previous one of this array gets the same descriptor: skip the view, sampler-variant
+        // and rescaling lookups (~85% of the entries there).
+        VideoCommon::ImageViewId previous_view_id{};
+        VideoCommon::SamplerId previous_sampler_id{};
+        VkImageView previous_vk_view{VK_NULL_HANDLE};
+        VkSampler previous_vk_sampler{VK_NULL_HANDLE};
+        bool has_previous{};
         for (u32 index = 0; index < desc.count; ++index) {
             const VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
+            if (has_previous && image_view_id == previous_view_id &&
+                sampler_id == previous_sampler_id) {
+                guest_descriptor_queue.AddSampledImage(previous_vk_view, previous_vk_sampler);
+                continue;
+            }
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
             if (vk_image_view == VK_NULL_HANDLE) {
@@ -504,28 +681,35 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
             }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
-            guest_descriptor_queue.AddSampledImage(vk_image_view,
-                                                   sampler.HandleFor(image_view, desc.is_depth));
+            const VkSampler vk_sampler{sampler.HandleFor(image_view, desc.is_depth)};
+            guest_descriptor_queue.AddSampledImage(vk_image_view, vk_sampler);
             if (rescaling_active) {
                 is_rescaled |= texture_cache.IsRescaling(image_view);
             }
+            previous_view_id = image_view_id;
+            previous_sampler_id = sampler_id;
+            previous_vk_view = vk_image_view;
+            previous_vk_sampler = vk_sampler;
+            has_previous = true;
         }
         rescaling.PushTexture(is_rescaled);
     }
-    for (const auto& desc : info.image_descriptors) {
-        bool is_rescaled{};
-        for (u32 index = 0; index < desc.count; ++index) {
-            ImageView& image_view{texture_cache.GetImageView((views++)->id)};
-            if (desc.is_written) {
-                texture_cache.MarkModification(image_view.image_id);
+    if constexpr (HasImages) {
+        for (const auto& desc : info.image_descriptors) {
+            bool is_rescaled{};
+            for (u32 index = 0; index < desc.count; ++index) {
+                ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+                if (desc.is_written) {
+                    texture_cache.MarkModification(image_view.image_id);
+                }
+                const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
+                guest_descriptor_queue.AddImage(vk_image_view);
+                if (rescaling_active) {
+                    is_rescaled |= texture_cache.IsRescaling(image_view);
+                }
             }
-            const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
-            guest_descriptor_queue.AddImage(vk_image_view);
-            if (rescaling_active) {
-                is_rescaled |= texture_cache.IsRescaling(image_view);
-            }
+            rescaling.PushImage(is_rescaled);
         }
-        rescaling.PushImage(is_rescaled);
     }
 }
 

@@ -14,7 +14,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <type_traits>
 #include <vector>
@@ -22,6 +24,7 @@
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/shader_handle_program.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -80,6 +83,18 @@ class Scheduler;
 /// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
 /// a compute shader that writes its output to a storage buffer, and this vertex shader draws it
 /// (see Shader::Backend::SPIRV::EmitMeshEmulationVertex).
+class GraphicsPipelineLibraryCache;
+
+/// Shader modules shared by the graphics pipelines whose stages are the same SPIR-V, so they can
+/// share VK_EXT_graphics_pipeline_library parts: GraphicsPipelineLibraryCache keys the shader
+/// parts by this object's address and keeps it alive with them.
+struct GraphicsShaderSet {
+    std::array<vk::ShaderModule, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> modules;
+    /// Pipelines built from this set (PipelineCache::FindOrMakeShaderSet). Parts are only
+    /// compiled once a second pipeline shares the set: with one, nothing would link from them.
+    mutable std::atomic<u32> pipelines{0};
+};
+
 struct MeshEmulationSetup {
     std::vector<u32> vertex_spirv;
     u32 output_binding{};
@@ -115,7 +130,12 @@ public:
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
         std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
-        std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
+        std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt,
+        std::shared_ptr<const GraphicsShaderSet> shader_set = {},
+        GraphicsPipelineLibraryCache* library_cache = nullptr,
+        Common::ThreadWorker* library_part_workers = nullptr,
+        PipelineLayoutCache* layout_cache = nullptr, bool fill_library_parts = false);
+    ~GraphicsPipeline();
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
@@ -229,14 +249,7 @@ public:
         return configure_func(this, is_indexed);
     }
 
-    [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
-        if (key == current_key) {
-            return this;
-        }
-        const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
-        return it != transition_keys.end() ? transitions[std::distance(transition_keys.begin(), it)]
-                                           : nullptr;
-    }
+    [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept;
 
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
     void MarkUsed(u64 frame) noexcept {
@@ -281,11 +294,18 @@ private:
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are, bool is_indexed);
 
-    void MakePipeline(VkRenderPass render_pass);
+    /// With `parts_only`, compiles the library parts of this pipeline's create info and keeps
+    /// nothing else (QueueLibraryParts).
+    void MakePipeline(VkRenderPass render_pass, bool parts_only = false);
+
+    /// After a pipeline new this session was compiled whole: its library parts on the part
+    /// workers, for the next pipeline with the same shaders to link.
+    void QueueLibraryParts(RenderPassCache& render_pass_cache);
 
     void Validate();
 
     const GraphicsPipelineCacheKey key;
+    const size_t transition_hash{key.Hash()};
     Tegra::Engines::Maxwell3D* maxwell3d;
     Tegra::MemoryManager* gpu_memory;
     const Device& device;
@@ -300,13 +320,34 @@ private:
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
+    std::array<size_t, 16> transition_hashes{};
     u64 last_use_frame{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
+    /// The stages' modules: spv_modules', or shader_set's when pipelines share them.
+    std::array<VkShaderModule, NUM_STAGES> modules{};
+    std::shared_ptr<const GraphicsShaderSet> shader_set;
+    GraphicsPipelineLibraryCache* library_cache{};
+    Common::ThreadWorker* library_part_workers{};
+    /// The pipeline cache's build workers (null for builds on the calling thread).
+    Common::ThreadWorker* build_workers{};
+    bool fill_library_parts{};
+    /// Set by MakePipeline when it compiled whole a pipeline that could link from parts.
+    bool compiled_whole_for_library{};
+    /// A queued QueueLibraryParts task checks `cancelled` under `mutex`: the destructor sets it,
+    /// waiting for a task that runs.
+    struct LibraryPartsTask {
+        std::mutex mutex;
+        bool cancelled{};
+    };
+    std::shared_ptr<LibraryPartsTask> library_parts_task;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
+    std::array<std::vector<VideoCommon::TextureHandleCache>, NUM_STAGES> handle_caches;
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
+    u64 nx2_skip_contents{}; ///< ... and its uniform bytes' hash
+    bool nx2_skip_seen{};
     u32 num_descriptor_entries{};
     size_t num_image_elements{};
     std::vector<SampledImage> sampled_images;
@@ -316,20 +357,27 @@ private:
     bool writes_storage{};
     bool has_render_area_push_constants{};
 
-    vk::DescriptorSetLayout descriptor_set_layout;
+    /// Owns the three handles below, shared with pipelines of the same layout (PipelineLayoutCache).
+    std::shared_ptr<const PipelineLayouts> layouts;
+    VkDescriptorSetLayout descriptor_set_layout{};
     DescriptorAllocator descriptor_allocator;
-    vk::PipelineLayout pipeline_layout;
-    vk::DescriptorUpdateTemplate descriptor_update_template;
+    VkPipelineLayout pipeline_layout{};
+    VkDescriptorUpdateTemplate descriptor_update_template{};
     vk::Pipeline pipeline;
 
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
     std::vector<u8> last_descriptor_bytes;
+    VkDeviceSize last_bound_descriptor_offset{};
+    u32 last_bound_descriptor_chunk{};
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
     std::array<u32, 6> last_rescaling_words{};
     bool has_pushed_rescaling{false};
+    u64 last_configure_recording_epoch{~u64{0}};
+    std::array<f32, 4> last_render_area_words{};
+    bool last_uses_render_area{};
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};

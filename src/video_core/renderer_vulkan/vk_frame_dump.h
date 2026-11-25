@@ -127,6 +127,48 @@ public:
         std::vector<u8> guest;
     };
 
+    /// The current draw's arguments as the engine holds them. For an indirect draw, the first
+    /// argument records as guest memory holds them (stale when the GPU wrote them).
+    struct DrawArgs {
+        u32 topology;
+        bool indexed;
+        u32 vertex_first;
+        u32 vertex_count;
+        u32 index_first;
+        u32 index_count;
+        u32 index_format;
+        u32 base_vertex;
+        u32 base_instance;
+        u32 instance_count;
+        bool indirect;
+        bool include_count;
+        bool from_record;
+        bool indirect_gpu_modified;
+        GPUVAddr indirect_addr;
+        GPUVAddr count_addr;
+        u32 max_draws;
+        u32 stride;
+        std::vector<u32> indirect_words;
+        /// Raw vertex_attrib_format and vertex_streams words of the enabled ones.
+        std::vector<std::pair<u32, u32>> attributes;
+        std::vector<std::pair<u32, u32>> streams;
+    };
+
+    /// A bound index (slot -1), indirect argument (slot -2) or vertex buffer. Guest bytes are
+    /// always kept; the cached host
+    /// copy is read back too, so the two can be compared.
+    struct VertexInput {
+        s32 slot;
+        GPUVAddr gpu_addr;
+        u64 device_addr;
+        u32 bound_size;
+        u32 size;
+        bool gpu_modified;
+        VkBuffer host;
+        u32 host_offset;
+        std::vector<u8> guest;
+    };
+
     explicit FrameDump(const Device& device, MemoryAllocator& memory_allocator,
                        Scheduler& scheduler);
     ~FrameDump();
@@ -152,6 +194,11 @@ public:
     /// to run not yet seen for their shader. Returns true when copies were recorded.
     bool NoteBuffers(bool compute, std::span<const u64> shader_hashes,
                      std::span<BoundBuffer> buffers);
+    /// Records the current draw's arguments ("draw_args") and its index and vertex buffers not yet
+    /// seen this frame, each as guest bytes and, when cached, host bytes. Returns true when copies
+    /// were recorded.
+    bool NoteDrawInputs(std::span<const u64> shader_hashes, const DrawArgs& args,
+                        std::span<VertexInput> inputs);
     /// Records the group counts of the dispatch about to run.
     void NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
                     const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,
@@ -259,7 +306,12 @@ private:
     /// (compute shader hash, image address, format/level/layer) already read back this frame.
     std::vector<std::tuple<u64, GPUVAddr, u32>> dispatch_sampled;
     /// (shader hash, storage, binding index, device address, size) already recorded this frame.
-    std::vector<std::tuple<u64, bool, u32, u64, u32>> seen_buffers;
+    /// Shader, storage, index, address and size of a recorded buffer, with the hash of the guest
+    /// bytes last recorded for it (0 for host-read buffers).
+    using SeenBuffer = std::pair<std::tuple<u64, bool, u32, u64, u32>, u64>;
+    std::vector<SeenBuffer> seen_buffers;
+    /// (device address, size) of the index and vertex buffers already recorded this frame.
+    std::vector<std::pair<u64, u32>> seen_vertex_inputs;
     /// Content hashes of the buffer files written; writer thread only.
     std::vector<u64> written_buffers;
     /// (shader hash, native program key) of the shaders seen this capture.
